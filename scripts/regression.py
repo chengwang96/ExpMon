@@ -104,10 +104,35 @@ def main() -> None:
         click_nav(page, 1)
         expect(page.get_by_role("heading", name="Host / SSH Servers")).to_be_visible()
         if page.get_by_role("button", name="Test Connection").count() > 0:
-            expect(page.get_by_role("button", name="Refresh Resources").first).to_be_visible()
-            note("PASS: SSH test action rendered")
+            expect(page.get_by_role("button", name="Refresh Resources")).to_have_count(0)
+            note("PASS: SSH test action rendered without manual resource refresh")
         else:
             note("SKIP: SSH test action, no remote SSH server configured")
+
+        click_nav(page, 4)
+        expect(page.get_by_role("heading", name="Config", exact=True)).to_be_visible()
+        host_input = page.locator("label", has_text="Host ID").locator("input")
+        original_host = host_input.input_value()
+        host_input.fill("draft-host-not-saved")
+        page.wait_for_timeout(4200)
+        if host_input.input_value() != "draft-host-not-saved":
+            raise AssertionError("config draft was overwritten by auto refresh")
+        host_input.fill(original_host)
+        note("PASS: config draft survives auto refresh")
+
+        unmanaged_input = page.locator("label", has_text="Unmanaged process limit").locator("input")
+        original_unmanaged = unmanaged_input.input_value()
+        temporary_unmanaged = "81" if original_unmanaged != "81" else "82"
+        unmanaged_input.fill(temporary_unmanaged)
+        page.get_by_role("button", name="Save Config").click()
+        expect(page.get_by_text("Collector config saved")).to_be_visible(timeout=10000)
+        page.wait_for_timeout(700)
+        if unmanaged_input.input_value() != temporary_unmanaged:
+            raise AssertionError("saved config value did not remain in the UI")
+        unmanaged_input.fill(original_unmanaged)
+        page.get_by_role("button", name="Save Config").click()
+        expect(page.get_by_text("Collector config saved")).to_be_visible(timeout=10000)
+        note("PASS: config save round-trip")
 
         page.set_viewport_size({"width": 390, "height": 900})
         click_nav(page, 0)

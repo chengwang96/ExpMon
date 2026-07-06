@@ -1816,6 +1816,91 @@ h3 {
   color: var(--cyan);
 }
 
+.ssh-manage-chip {
+  width: 168px;
+  min-width: 168px;
+  gap: 0;
+  padding: 5px;
+  border-color: rgba(126, 199, 184, 0.42);
+  color: var(--text);
+  background:
+    linear-gradient(135deg, rgba(19, 138, 126, 0.08), rgba(255, 255, 255, 0.94) 62%),
+    #ffffff;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.74);
+}
+
+.ssh-manage-row {
+  appearance: none;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 43px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+  transition: background 150ms ease, color 150ms ease, transform 150ms ease;
+}
+
+.ssh-manage-row + .ssh-manage-row {
+  margin-top: 3px;
+}
+
+.ssh-manage-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  font-weight: 740;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.ssh-manage-row svg {
+  display: block;
+  width: 24px;
+  height: 24px;
+  padding: 5px;
+  border-radius: 6px;
+  color: var(--cyan);
+  background: rgba(19, 138, 126, 0.12);
+}
+
+.ssh-manage-row.add {
+  color: var(--cyan);
+}
+
+.ssh-manage-row.clear {
+  color: #475569;
+}
+
+.ssh-manage-row.clear svg {
+  color: var(--danger);
+  background: rgba(196, 61, 61, 0.08);
+}
+
+.ssh-manage-row.clear small {
+  grid-column: 2;
+  margin-top: -7px;
+  color: var(--muted);
+}
+
+.ssh-manage-row:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.ssh-manage-row:not(:disabled):hover {
+  background: rgba(19, 138, 126, 0.08);
+}
+
+.ssh-manage-row.clear:not(:disabled):hover {
+  background: rgba(196, 61, 61, 0.06);
+}
+
 .selector-chip small {
   color: var(--muted);
   font-size: 11px;

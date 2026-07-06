@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -429,13 +430,12 @@ def validate_and_save_ssh_server(payload: dict[str, Any]) -> tuple[int, dict[str
     if not isinstance(server, dict):
         return 500, {"ok": False, "error": "failed to prepare ssh server"}
     test_payload = test_ssh_server_doc(server)
-    if not test_payload.get("ok"):
-        return 400, {"ok": False, "error": test_payload.get("message") or "ssh connection failed", "test": test_payload}
     write_ssh_servers_raw(saved.get("servers", []))
     return 200, {
         "ok": True,
         "server": public_ssh_server(server),
         "test": test_payload,
+        "warning": "" if test_payload.get("ok") else (test_payload.get("message") or "ssh connection test failed"),
         "storagePath": str(SSH_SERVERS_PATH),
     }
 
@@ -447,6 +447,11 @@ def delete_ssh_server(server_id: str) -> tuple[int, dict[str, Any]]:
         return 404, {"ok": False, "error": "ssh server not found"}
     write_ssh_servers_raw(next_servers)
     return 200, {"ok": True, "serverId": server_id}
+
+
+def clear_ssh_servers() -> tuple[int, dict[str, Any]]:
+    write_ssh_servers_raw([])
+    return 200, {"ok": True, "deleted": True}
 
 
 def ssh_server_key(server: dict[str, Any]) -> tuple[str, str, int]:
@@ -471,6 +476,16 @@ def dedupe_ssh_servers(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def ssh_server_by_id(server_id: str) -> dict[str, Any] | None:
     return next((server for server in read_ssh_servers_raw() if str(server.get("id")) == server_id), None)
+
+
+def resolve_ssh_key_path(key_path: str) -> Path:
+    path = config_path(key_path) if not Path(key_path).expanduser().is_absolute() else Path(key_path).expanduser()
+    if path.is_dir():
+        for name in ("id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"):
+            candidate = path / name
+            if candidate.exists():
+                return candidate
+    return path
 
 
 def ssh_command_for_server(server: dict[str, Any], remote_command: str) -> tuple[list[str] | None, dict[str, Any] | None]:
@@ -512,7 +527,7 @@ def ssh_command_for_server(server: dict[str, Any], remote_command: str) -> tuple
         if not key_path:
             return None, {"ok": False, "error": "keyPath is missing", "server": public_ssh_server(server)}
         command.extend(["-o", "BatchMode=yes"])
-        command.extend(["-i", str(config_path(key_path) if not Path(key_path).expanduser().is_absolute() else Path(key_path).expanduser())])
+        command.extend(["-i", str(resolve_ssh_key_path(key_path))])
     else:
         command = ["sshpass", "-p", str(server.get("password") or ""), *command]
     command.extend([target, remote_command])
@@ -683,13 +698,150 @@ print(json.dumps({
 """
 
 
+def run_ssh_remote_command(server: dict[str, Any], remote_command: str, timeout: int = 15) -> tuple[subprocess.CompletedProcess[str] | None, dict[str, Any] | None, int]:
+    command, error_payload = ssh_command_for_server(server, remote_command)
+    if error_payload:
+        return None, error_payload, 400 if error_payload.get("error") else 200
+    if not command:
+        return None, {"ok": False, "error": "failed to build ssh command", "server": public_ssh_server(server)}, 500
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, {"ok": False, "supported": True, "message": "remote command timed out"}, 200
+    return completed, None, 200
+
+
+def detect_remote_os(server: dict[str, Any]) -> str:
+    completed, _, _ = run_ssh_remote_command(server, "uname -s", timeout=6)
+    if completed and completed.returncode == 0:
+        value = completed.stdout.strip().lower()
+        if "darwin" in value:
+            return "macos"
+        if "linux" in value:
+            return "linux"
+    completed, _, _ = run_ssh_remote_command(server, "ver", timeout=6)
+    if completed and completed.returncode == 0 and "windows" in (completed.stdout + completed.stderr).lower():
+        return "windows"
+    return "unknown"
+
+
+WINDOWS_RESOURCE_SCRIPT = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$os = Get-CimInstance Win32_OperatingSystem
+$processors = @(Get-CimInstance Win32_Processor)
+$logical = 0
+$loadValues = @()
+foreach ($processor in $processors) {
+  $logical += [int]($processor.NumberOfLogicalProcessors)
+  if ($null -ne $processor.LoadPercentage) { $loadValues += [double]$processor.LoadPercentage }
+}
+if ($logical -le 0) { $logical = [Environment]::ProcessorCount }
+$cpuUsage = 0
+if ($loadValues.Count -gt 0) { $cpuUsage = [Math]::Round(($loadValues | Measure-Object -Average).Average, 1) }
+$memoryTotal = 0
+$memoryUsed = 0
+if ($os) {
+  $memoryTotal = [Math]::Round([double]$os.TotalVisibleMemorySize / 1048576, 2)
+  $memoryUsed = [Math]::Round(([double]$os.TotalVisibleMemorySize - [double]$os.FreePhysicalMemory) / 1048576, 2)
+}
+$gpuRows = @()
+$nvidia = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+if ($nvidia) {
+  $query = 'index,uuid,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu'
+  $lines = & $nvidia.Source "--query-gpu=$query" "--format=csv,noheader,nounits" 2>$null
+  foreach ($line in $lines) {
+    $parts = @($line -split ',' | ForEach-Object { $_.Trim() })
+    if ($parts.Count -ge 9) {
+      $total = [double]($parts[3] -replace '[^0-9\.]','')
+      $used = [double]($parts[4] -replace '[^0-9\.]','')
+      $util = [double]($parts[5] -replace '[^0-9\.]','')
+      $gpuRows += [pscustomobject]@{
+        index = [int]$parts[0]
+        uuid = $parts[1]
+        name = $parts[2]
+        memoryTotalMiB = $total
+        memoryUsedMiB = $used
+        memoryPercent = $(if ($total -gt 0) { [Math]::Round(($used / $total) * 100, 1) } else { 0 })
+        utilization = $util
+        powerDrawW = [double]($parts[6] -replace '[^0-9\.]','')
+        powerLimitW = [double]($parts[7] -replace '[^0-9\.]','')
+        temperatureC = [double]($parts[8] -replace '[^0-9\.]','')
+        busy = ($util -gt 0 -or $used -gt 0)
+        processes = @()
+      }
+    }
+  }
+}
+[pscustomobject]@{
+  hostname = $env:COMPUTERNAME
+  os = "windows / $($os.Caption)"
+  user = $env:USERNAME
+  cpuUsage = $cpuUsage
+  cores = @(0..([Math]::Max($logical - 1, 0)) | ForEach-Object { 0 })
+  memoryUsedGb = $memoryUsed
+  memoryTotalGb = $memoryTotal
+  gpus = $gpuRows
+  gpusTotal = $gpuRows.Count
+  gpusBusy = @($gpuRows | Where-Object { $_.busy }).Count
+} | ConvertTo-Json -Compress -Depth 6
+'''
+
+
+def windows_resource_command() -> str:
+    encoded = base64.b64encode(WINDOWS_RESOURCE_SCRIPT.encode("utf-16le")).decode("ascii")
+    return f"powershell -NoProfile -EncodedCommand {encoded}"
+
+
+def posix_resource_command() -> str:
+    quoted_script = shlex.quote(REMOTE_RESOURCE_SCRIPT)
+    candidates = [
+        "$HOME/miniconda3/bin/python",
+        "$HOME/anaconda3/bin/python",
+        "$HOME/mambaforge/bin/python",
+        "$HOME/miniforge3/bin/python",
+        "$HOME/miniconda/bin/python",
+        "$HOME/anaconda/bin/python",
+        "/opt/conda/bin/python",
+        "/opt/mamba/bin/python",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+        "python3",
+        "python",
+    ]
+    candidate_text = " ".join(f'"{candidate}"' if candidate.startswith("$HOME/") else shlex.quote(candidate) for candidate in candidates)
+    return (
+        "for py in "
+        f"{candidate_text}; do "
+        "if [ -x \"$py\" ]; then "
+        "echo EXPMON_PYTHON=$py 1>&2; exec \"$py\" -c "
+        f"{quoted_script}; "
+        "elif command -v \"$py\" >/dev/null 2>&1; then "
+        "resolved=$(command -v \"$py\"); echo EXPMON_PYTHON=$resolved 1>&2; exec \"$resolved\" -c "
+        f"{quoted_script}; "
+        "fi; "
+        "done; echo EXPMON_PYTHON_NOT_FOUND 1>&2; exit 127"
+    )
+
+
 def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
     server = ssh_server_by_id(server_id)
     if not server:
         return 404, {"ok": False, "error": "ssh server not found"}
 
-    quoted_script = shlex.quote(REMOTE_RESOURCE_SCRIPT)
-    remote_command = f"python3 -c {quoted_script} 2>/dev/null || python -c {quoted_script}"
+    remote_os = detect_remote_os(server)
+    if remote_os == "windows":
+        remote_command = windows_resource_command()
+    else:
+        remote_command = posix_resource_command()
     command, error_payload = ssh_command_for_server(server, remote_command)
     if error_payload:
         return 400 if error_payload.get("error") else 200, error_payload
@@ -713,11 +865,16 @@ def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
             "server": public_ssh_server(server),
             "sampledAt": datetime.now().isoformat(timespec="seconds"),
             "latencyMs": int((time.time() - started) * 1000),
-            "message": "remote resource snapshot timed out",
+            "message": f"remote {remote_os} resource snapshot timed out",
         }
 
     stdout = completed.stdout.strip()
     stderr = completed.stderr.strip()
+    python_path = ""
+    for line in stderr.splitlines():
+        if line.startswith("EXPMON_PYTHON="):
+            python_path = line.split("=", 1)[1].strip()
+            break
     try:
         parsed = json.loads(stdout.splitlines()[-1]) if stdout else {}
     except json.JSONDecodeError:
@@ -731,6 +888,8 @@ def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
             "latencyMs": int((time.time() - started) * 1000),
             "stdout": stdout[:2000],
             "stderr": stderr[:2000],
+            "remoteOs": remote_os,
+            "pythonPath": python_path,
             "message": stderr or stdout or f"ssh exited with {completed.returncode}",
         }
 
@@ -760,6 +919,8 @@ def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
         "server": public_ssh_server(server),
         "sampledAt": datetime.now().isoformat(timespec="seconds"),
         "latencyMs": int((time.time() - started) * 1000),
+        "remoteOs": remote_os,
+        "pythonPath": python_path,
         "host": host,
         "message": "remote resource snapshot ok",
     }
@@ -3045,6 +3206,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/ssh/servers":
+            status, payload = clear_ssh_servers()
+            self.send_json(payload, status=status)
+            return
         match = re.fullmatch(r"/api/ssh/servers/([^/]+)", path)
         if match:
             server_id = unquote(match.group(1))

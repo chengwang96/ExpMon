@@ -36,7 +36,7 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 type ResourceType = "cpu_only" | "gpu" | "hybrid" | "unknown";
 type RunStatus = "running" | "finished" | "failed" | "killed" | "unmanaged";
@@ -172,6 +172,8 @@ type SshTestResult = {
   sampledAt?: string;
   latencyMs?: number;
   hostname?: string;
+  remoteOs?: string;
+  pythonPath?: string;
   host?: Host;
   stdout?: string;
   stderr?: string;
@@ -495,6 +497,9 @@ const TEXT = {
     noLocalResourceBody: "采集器启动后会显示 GPU、内存和 CPU 核心使用率。",
     noNvidiaGpu: "未检测到 NVIDIA GPU",
     noNvidiaGpuBody: "如果机器有 NVIDIA 显卡，请确认 nvidia-smi 可用。",
+    remoteInitializing: "初始化环境中",
+    remoteResourcesNotLoaded: "远端资源尚未读取",
+    remoteResourceLoadFailed: "远端资源读取失败",
     systemMemory: "系统内存",
     notOccupied: "未占用",
     notDetected: "未检测",
@@ -706,6 +711,9 @@ const TEXT = {
     noLocalResourceBody: "GPU, memory, and CPU core usage appear after the collector starts.",
     noNvidiaGpu: "No NVIDIA GPU detected",
     noNvidiaGpuBody: "If this machine has an NVIDIA GPU, check that nvidia-smi is available.",
+    remoteInitializing: "initializing environment",
+    remoteResourcesNotLoaded: "remote resources not loaded",
+    remoteResourceLoadFailed: "remote resource loading failed",
     systemMemory: "System Memory",
     notOccupied: "not occupied",
     notDetected: "not detected",
@@ -837,10 +845,42 @@ function App() {
   const [metadataSaveInFlight, setMetadataSaveInFlight] = useState("");
   const [configSaveInFlight, setConfigSaveInFlight] = useState(false);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const snapshotRef = useRef(snapshot);
+  const remoteHostsRef = useRef(remoteHosts);
+  const optimisticDeletedRunIdsRef = useRef<Set<string>>(new Set());
+  const optimisticDeletedSshIdsRef = useRef<Set<string>>(new Set());
+  const optimisticClearSshRef = useRef(false);
+  const sshResourceInFlightRef = useRef<Set<string>>(new Set());
+  const sshAutoStartedRef = useRef<Set<string>>(new Set());
+  const sshServersRef = useRef<SshServer[]>([]);
   const t = useCallback((key: TextKey) => translate(language, key), [language]);
   const setLanguage = useCallback((nextLanguage: Language) => {
     setLanguageState(nextLanguage);
     window.localStorage.setItem("expmon-language", nextLanguage);
+  }, []);
+
+  useEffect(() => {
+    snapshotRef.current = snapshot;
+  }, [snapshot]);
+
+  useEffect(() => {
+    remoteHostsRef.current = remoteHosts;
+  }, [remoteHosts]);
+
+  const updateSnapshot = useCallback((updater: (current: Snapshot) => Snapshot) => {
+    setSnapshot((current) => {
+      const next = updater(current);
+      snapshotRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const updateRemoteHosts = useCallback((updater: (current: Host[]) => Host[]) => {
+    setRemoteHosts((current) => {
+      const next = updater(current);
+      remoteHostsRef.current = next;
+      return next;
+    });
   }, []);
 
   const refreshSnapshot = useCallback(() => {
@@ -852,17 +892,28 @@ function App() {
         return response.json() as Promise<{ hosts: Host[]; runs: Run[]; projects?: Project[]; diagnostics?: Diagnostic[]; config?: CollectorConfig; configMetadata?: ConfigMetadata; sshServers?: SshServer[]; sshKeyCandidates?: string[] }>;
       })
       .then((payload) => {
-        setSnapshot({
+        const hiddenRunIds = optimisticDeletedRunIdsRef.current;
+        const hiddenSshIds = optimisticDeletedSshIdsRef.current;
+        const visibleRuns = payload.runs.filter((run) => !hiddenRunIds.has(run.id));
+        const visibleSshServers = optimisticClearSshRef.current
+          ? []
+          : (payload.sshServers ?? []).filter((server) => !hiddenSshIds.has(server.id));
+        let nextSnapshot: Snapshot = {
           hosts: payload.hosts,
-          runs: payload.runs,
+          runs: visibleRuns,
           projects: payload.projects ?? [],
           diagnostics: payload.diagnostics ?? [],
           connected: true,
           config: payload.config,
           configMetadata: payload.configMetadata,
-          sshServers: payload.sshServers ?? [],
+          sshServers: visibleSshServers,
           sshKeyCandidates: payload.sshKeyCandidates ?? []
+        };
+        hiddenRunIds.forEach((runId) => {
+          nextSnapshot = removeRunFromSnapshot(nextSnapshot, runId);
         });
+        snapshotRef.current = nextSnapshot;
+        setSnapshot(nextSnapshot);
         setLastRefreshAt(new Date());
       })
       .catch((error: Error) => {
@@ -941,7 +992,14 @@ function App() {
 
   const performDeleteRunRecord = useCallback((run: Run) => {
     setDeleteInFlight(run.id);
-    setOperationMessage(language === "zh" ? "正在删除任务记录..." : "Deleting run record...");
+    optimisticDeletedRunIdsRef.current.add(run.id);
+    updateSnapshot((current) => removeRunFromSnapshot(current, run.id));
+    setSelectedRunId((current) => (
+      current === run.id
+        ? (snapshotRef.current.runs.find((item) => item.id !== run.id)?.id ?? "")
+        : current
+    ));
+    setOperationMessage(language === "zh" ? "任务记录已从列表移除，正在后台删除..." : "Run record hidden; deleting in the background...");
     fetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}`, {
       method: "DELETE"
     })
@@ -953,16 +1011,19 @@ function App() {
         return payload as { deletedPath?: string };
       })
       .then(() => {
+        optimisticDeletedRunIdsRef.current.delete(run.id);
         setOperationMessage(language === "zh" ? "任务记录已删除" : "Run record deleted");
         refreshSnapshot();
       })
       .catch((error: Error) => {
+        optimisticDeletedRunIdsRef.current.delete(run.id);
+        updateSnapshot((current) => restoreRunInSnapshot(current, run));
         setOperationMessage(language === "zh" ? `删除失败：${error.message}` : `Delete failed: ${error.message}`);
       })
       .finally(() => {
         setDeleteInFlight("");
       });
-  }, [language, refreshSnapshot]);
+  }, [language, refreshSnapshot, updateSnapshot]);
 
   const deleteRunRecord = useCallback((run: Run) => {
     if (!canDeleteRunRecord(run)) {
@@ -1004,8 +1065,8 @@ function App() {
       })
       .then((payload) => {
         setOperationMessage(language === "zh" ? "SSH 服务器已保存" : "SSH server saved");
-        if (payload.server && payload.test?.ok) {
-          handleRemoteHostRefresh(hostFromSshServer(payload.server, payload.test));
+        if (payload.server) {
+          handleRemoteHostRefresh(hostFromSshServer(payload.server, payload.test, payload.test?.ok ? "initializing" : "idle"));
         }
         refreshSnapshot();
         return payload;
@@ -1021,7 +1082,15 @@ function App() {
 
   const performDeleteSshServer = useCallback((server: SshServer) => {
     setSshDeleteInFlight(server.id);
-    setOperationMessage(language === "zh" ? "正在删除 SSH 服务器..." : "Deleting SSH server...");
+    optimisticDeletedSshIdsRef.current.add(server.id);
+    sshAutoStartedRef.current.delete(server.id);
+    sshResourceInFlightRef.current.delete(server.id);
+    updateSnapshot((current) => removeSshServerFromSnapshot(current, server.id));
+    updateRemoteHosts((current) => current.filter((host) => host.id !== `ssh:${server.id}`));
+    if (selectedHostId === `ssh:${server.id}`) {
+      setSelectedHostId(snapshotRef.current.hosts[0]?.id ?? "local");
+    }
+    setOperationMessage(language === "zh" ? "SSH 服务器已从列表移除，正在后台删除..." : "SSH server hidden; deleting in the background...");
     fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}`, {
       method: "DELETE"
     })
@@ -1032,17 +1101,24 @@ function App() {
         }
       })
       .then(() => {
-        setRemoteHosts((current) => current.filter((host) => host.id !== `ssh:${server.id}`));
+        optimisticDeletedSshIdsRef.current.delete(server.id);
         setOperationMessage(language === "zh" ? "SSH 服务器已删除" : "SSH server deleted");
         refreshSnapshot();
       })
       .catch((error: Error) => {
+        optimisticDeletedSshIdsRef.current.delete(server.id);
+        updateSnapshot((current) => restoreSshServerInSnapshot(current, server));
+        updateRemoteHosts((current) => (
+          current.some((host) => host.id === `ssh:${server.id}`)
+            ? current
+            : [...current, hostFromSshServer(server)]
+        ));
         setOperationMessage(language === "zh" ? `删除 SSH 服务器失败：${error.message}` : `Deleting SSH server failed: ${error.message}`);
       })
       .finally(() => {
         setSshDeleteInFlight("");
       });
-  }, [language, refreshSnapshot]);
+  }, [language, refreshSnapshot, selectedHostId, updateRemoteHosts, updateSnapshot]);
 
   const deleteSshServer = useCallback((server: SshServer) => {
     const label = server.name || server.host;
@@ -1056,6 +1132,58 @@ function App() {
       onConfirm: () => performDeleteSshServer(server)
     });
   }, [language, performDeleteSshServer, requestConfirm, t]);
+
+  const clearSshServers = useCallback(() => {
+    requestConfirm({
+      title: language === "zh" ? "清空所有 SSH 服务器？" : "Clear all SSH servers?",
+      body: language === "zh"
+        ? "这会删除本地保存的所有 SSH 连接配置。"
+        : "This removes all locally saved SSH connection configurations.",
+      confirmLabel: language === "zh" ? "清空" : "Clear all",
+      tone: "danger",
+      onConfirm: () => {
+        const previousSshServers = snapshotRef.current.sshServers ?? [];
+        const previousRemoteHosts = remoteHostsRef.current;
+        optimisticClearSshRef.current = true;
+        previousSshServers.forEach((server) => {
+          sshAutoStartedRef.current.delete(server.id);
+          sshResourceInFlightRef.current.delete(server.id);
+        });
+        setSshDeleteInFlight("all");
+        updateSnapshot((current) => ({
+          ...current,
+          sshServers: []
+        }));
+        updateRemoteHosts((current) => current.filter((host) => !host.id.startsWith("ssh:")));
+        if (selectedHostId.startsWith("ssh:")) {
+          setSelectedHostId(snapshotRef.current.hosts[0]?.id ?? "local");
+        }
+        setOperationMessage(language === "zh" ? "SSH 服务器已从列表清空，正在后台删除..." : "SSH servers hidden; clearing in the background...");
+        fetch(`${API_BASE}/api/ssh/servers`, { method: "DELETE" })
+          .then(async (response) => {
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.error || `collector ${response.status}`);
+            }
+          })
+          .then(() => {
+            optimisticClearSshRef.current = false;
+            setOperationMessage(language === "zh" ? "SSH 服务器已清空" : "SSH servers cleared");
+            refreshSnapshot();
+          })
+          .catch((error: Error) => {
+            optimisticClearSshRef.current = false;
+            updateSnapshot((current) => ({
+              ...current,
+              sshServers: previousSshServers
+            }));
+            updateRemoteHosts(() => previousRemoteHosts);
+            setOperationMessage(language === "zh" ? `清空 SSH 服务器失败：${error.message}` : `Clearing SSH servers failed: ${error.message}`);
+          })
+          .finally(() => setSshDeleteInFlight(""));
+      }
+    });
+  }, [language, refreshSnapshot, requestConfirm, selectedHostId, updateRemoteHosts, updateSnapshot]);
 
   const saveRunMetadata = useCallback((run: Run, patch: Partial<RunMetadata>) => {
     setMetadataSaveInFlight(run.id);
@@ -1110,18 +1238,91 @@ function App() {
       .finally(() => setConfigSaveInFlight(false));
   }, [language, refreshSnapshot]);
 
-  const handleRemoteHostRefresh = useCallback((host: Host) => {
-    setRemoteHosts((current) => {
+  const handleRemoteHostRefresh = useCallback((host: Host, navigate = true) => {
+    updateRemoteHosts((current) => {
       const next = current.filter((item) => item.id !== host.id);
       return [...next, host];
     });
-    setSelectedHostId(host.id);
-    setActiveView("hosts");
-  }, []);
+    if (navigate) {
+      setSelectedHostId(host.id);
+      setActiveView("hosts");
+    }
+  }, [updateRemoteHosts]);
+
+  const refreshSshServerResources = useCallback((server: SshServer, markInitializing = false) => {
+    if (sshResourceInFlightRef.current.has(server.id)) {
+      return;
+    }
+    sshResourceInFlightRef.current.add(server.id);
+    if (markInitializing) {
+      handleRemoteHostRefresh(hostFromSshServer(server, undefined, "initializing"), false);
+    }
+    fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/resources`, {
+      method: "POST"
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload.error || `collector ${response.status}`);
+        }
+        return payload as SshTestResult;
+      })
+      .then((payload) => {
+        if (payload.ok && payload.host) {
+          handleRemoteHostRefresh(payload.host, false);
+        } else {
+          handleRemoteHostRefresh(hostFromSshServer(server, payload, "failed"), false);
+        }
+      })
+      .catch((error: Error) => {
+        handleRemoteHostRefresh(hostFromSshServer(server, { ok: false, error: error.message, message: error.message }, "failed"), false);
+      })
+      .finally(() => {
+        sshResourceInFlightRef.current.delete(server.id);
+      });
+  }, [handleRemoteHostRefresh]);
+
+  useEffect(() => {
+    const servers = snapshot.sshServers ?? [];
+    sshServersRef.current = servers;
+    const activeIds = new Set(servers.map((server) => server.id));
+    Array.from(sshAutoStartedRef.current).forEach((serverId) => {
+      if (!activeIds.has(serverId)) {
+        sshAutoStartedRef.current.delete(serverId);
+      }
+    });
+    servers.forEach((server) => {
+      if (!sshAutoStartedRef.current.has(server.id)) {
+        sshAutoStartedRef.current.add(server.id);
+        refreshSshServerResources(server, true);
+      }
+    });
+  }, [refreshSshServerResources, snapshot.sshServers]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      sshServersRef.current.forEach((server) => refreshSshServerResources(server, false));
+    }, REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [refreshSshServerResources]);
 
   const hosts = useMemo(() => {
     const merged = [...snapshot.hosts];
+    const savedSshServers = snapshot.sshServers ?? [];
+    savedSshServers.forEach((server) => {
+      const host = hostFromSshServer(server);
+      const index = merged.findIndex((item) => item.id === host.id);
+      if (index >= 0) {
+        merged[index] = host;
+      } else {
+        merged.push(host);
+      }
+    });
+    const savedSshHostIds = new Set(savedSshServers.map((server) => `ssh:${server.id}`));
     remoteHosts.forEach((remoteHost) => {
+      if (remoteHost.id.startsWith("ssh:") && !savedSshHostIds.has(remoteHost.id)) {
+        return;
+      }
       const index = merged.findIndex((host) => host.id === remoteHost.id);
       if (index >= 0) {
         merged[index] = remoteHost;
@@ -1130,7 +1331,7 @@ function App() {
       }
     });
     return merged;
-  }, [remoteHosts, snapshot.hosts]);
+  }, [remoteHosts, snapshot.hosts, snapshot.sshServers]);
   const runs = snapshot.runs;
   useEffect(() => {
     if (runs.length && !runs.some((run) => run.id === selectedRunId)) {
@@ -1228,7 +1429,7 @@ function App() {
               <RefreshCw size={17} />
             </button>
             <span className="refresh-indicator">
-              {snapshot.connected ? t("collectorLive") : `${t("collectorOffline")}${snapshot.error ? `: ${snapshot.error}` : ""}`} · {t("refreshEvery")} · {formatClock(lastRefreshAt)}
+              {snapshot.connected ? t("collectorLive") : `${t("collectorOffline")}${snapshot.error ? `: ${snapshot.error}` : ""}`} · {formatClock(lastRefreshAt)}
             </span>
           </div>
         </header>
@@ -1258,6 +1459,7 @@ function App() {
             onSelectHost={setSelectedHostId}
             onSaveSshServer={saveSshServer}
             onDeleteSshServer={deleteSshServer}
+            onClearSshServers={clearSshServers}
             onRemoteHostRefresh={handleRemoteHostRefresh}
             sshSaveInFlight={sshSaveInFlight}
             sshDeleteInFlight={sshDeleteInFlight}
@@ -1282,6 +1484,7 @@ function App() {
           <ProjectsView
             projects={snapshot.projects ?? []}
             runs={runs}
+            hosts={hosts}
             onOpenRun={(runId) => {
               setSelectedRunId(runId);
               setActiveView("detail");
@@ -1597,6 +1800,52 @@ const linesToArray = (value: string) => (
 
 const arrayToLines = (value?: string[]) => (value ?? []).join("\n");
 
+const configFingerprint = (config?: CollectorConfig) => JSON.stringify(config ?? {});
+
+function removeRunFromSnapshot(current: Snapshot, runId: string): Snapshot {
+  return {
+    ...current,
+    runs: current.runs.filter((run) => run.id !== runId),
+    projects: current.projects?.map((project) => ({
+      ...project,
+      runs: project.runs.filter((id) => id !== runId)
+    })),
+    diagnostics: current.diagnostics?.filter((item) => item.runId !== runId)
+  };
+}
+
+function restoreRunInSnapshot(current: Snapshot, run: Run): Snapshot {
+  if (current.runs.some((item) => item.id === run.id)) {
+    return current;
+  }
+  return {
+    ...current,
+    runs: [run, ...current.runs],
+    projects: current.projects?.map((project) => (
+      project.name === run.project && !project.runs.includes(run.id)
+        ? { ...project, runs: [run.id, ...project.runs] }
+        : project
+    ))
+  };
+}
+
+function removeSshServerFromSnapshot(current: Snapshot, serverId: string): Snapshot {
+  return {
+    ...current,
+    sshServers: (current.sshServers ?? []).filter((server) => server.id !== serverId)
+  };
+}
+
+function restoreSshServerInSnapshot(current: Snapshot, server: SshServer): Snapshot {
+  if ((current.sshServers ?? []).some((item) => item.id === server.id)) {
+    return current;
+  }
+  return {
+    ...current,
+    sshServers: [server, ...(current.sshServers ?? [])]
+  };
+}
+
 function ConfigView({
   config,
   metadata,
@@ -1622,8 +1871,14 @@ function ConfigView({
   const [excludeKeywords, setExcludeKeywords] = useState(arrayToLines(config?.run_discovery?.exclude_command_keywords));
   const [rulesJson, setRulesJson] = useState(JSON.stringify(config?.run_discovery?.explicit_rules ?? [], null, 2));
   const [error, setError] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const [syncedFingerprint, setSyncedFingerprint] = useState(configFingerprint(config));
 
   useEffect(() => {
+    if (dirty) {
+      return;
+    }
+    const nextFingerprint = configFingerprint(config);
     setHostId(config?.host_id ?? "local");
     setIntervalValue(String(config?.sampling?.interval_seconds ?? 3));
     setUnmanagedTop(String(config?.sampling?.unmanaged_top_n ?? 80));
@@ -1633,7 +1888,13 @@ function ConfigView({
     setIncludeKeywords(arrayToLines(config?.run_discovery?.include_command_keywords));
     setExcludeKeywords(arrayToLines(config?.run_discovery?.exclude_command_keywords));
     setRulesJson(JSON.stringify(config?.run_discovery?.explicit_rules ?? [], null, 2));
-  }, [config]);
+    setSyncedFingerprint(nextFingerprint);
+  }, [config, dirty, syncedFingerprint]);
+
+  const updateField = (setter: (value: string) => void) => (value: string) => {
+    setDirty(true);
+    setter(value);
+  };
 
   const submit = () => {
     let explicitRules: Array<{ name?: string; project?: string; command_regex?: string }> = [];
@@ -1684,27 +1945,27 @@ function ConfigView({
         <div className="panel">
           <PanelTitle icon={Server} title="Collector" />
           <div className="config-form-grid">
-            <ConfigField label={labels.hostId} value={hostId} onChange={setHostId} />
-            <ConfigField label={labels.interval} value={interval} onChange={setIntervalValue} type="number" />
-            <ConfigField label={labels.unmanagedTop} value={unmanagedTop} onChange={setUnmanagedTop} type="number" />
+            <ConfigField label={labels.hostId} value={hostId} onChange={updateField(setHostId)} />
+            <ConfigField label={labels.interval} value={interval} onChange={updateField(setIntervalValue)} type="number" />
+            <ConfigField label={labels.unmanagedTop} value={unmanagedTop} onChange={updateField(setUnmanagedTop)} type="number" />
           </div>
         </div>
 
         <div className="panel">
           <PanelTitle icon={Layers3} title="Discovery" />
           <div className="config-form-grid two">
-            <ConfigTextarea label={labels.experimentRoots} hint={labels.onePerLine} value={experimentRoots} onChange={setExperimentRoots} />
-            <ConfigTextarea label={labels.includeCwd} hint={labels.onePerLine} value={includeCwd} onChange={setIncludeCwd} />
-            <ConfigTextarea label={labels.protocolRoots} hint={labels.onePerLine} value={protocolRoots} onChange={setProtocolRoots} />
+            <ConfigTextarea label={labels.experimentRoots} hint={labels.onePerLine} value={experimentRoots} onChange={updateField(setExperimentRoots)} />
+            <ConfigTextarea label={labels.includeCwd} hint={labels.onePerLine} value={includeCwd} onChange={updateField(setIncludeCwd)} />
+            <ConfigTextarea label={labels.protocolRoots} hint={labels.onePerLine} value={protocolRoots} onChange={updateField(setProtocolRoots)} />
           </div>
         </div>
 
         <div className="panel">
           <PanelTitle icon={SlidersHorizontal} title="Parser" />
           <div className="config-form-grid two">
-            <ConfigTextarea label={labels.includeKeywords} hint={labels.onePerLine} value={includeKeywords} onChange={setIncludeKeywords} />
-            <ConfigTextarea label={labels.excludeKeywords} hint={labels.onePerLine} value={excludeKeywords} onChange={setExcludeKeywords} />
-            <ConfigTextarea label={labels.explicitRules} value={rulesJson} onChange={setRulesJson} mono />
+            <ConfigTextarea label={labels.includeKeywords} hint={labels.onePerLine} value={includeKeywords} onChange={updateField(setIncludeKeywords)} />
+            <ConfigTextarea label={labels.excludeKeywords} hint={labels.onePerLine} value={excludeKeywords} onChange={updateField(setExcludeKeywords)} />
+            <ConfigTextarea label={labels.explicitRules} value={rulesJson} onChange={updateField(setRulesJson)} mono />
           </div>
         </div>
       </div>
@@ -1772,6 +2033,7 @@ function HostsView({
   onSelectHost,
   onSaveSshServer,
   onDeleteSshServer,
+  onClearSshServers,
   onRemoteHostRefresh,
   sshSaveInFlight,
   sshDeleteInFlight
@@ -1784,11 +2046,14 @@ function HostsView({
   onSelectHost: (hostId: string) => void;
   onSaveSshServer: (form: SshServerForm) => Promise<SshSaveResult>;
   onDeleteSshServer: (server: SshServer) => void;
+  onClearSshServers: () => void;
   onRemoteHostRefresh: (host: Host) => void;
   sshSaveInFlight: boolean;
   sshDeleteInFlight: string;
 }) {
   const t = useT();
+  const language = useContext(I18nContext);
+  const clearSshLabel = language === "zh" ? "清空 SSH" : "Clear SSH";
   const [historyRange, setHistoryRange] = useState<TimeRange>("15m");
   const [showSshForm, setShowSshForm] = useState(false);
   const hostRuns = runs.filter((run) => run.hostId === selectedHost.id);
@@ -1806,6 +2071,7 @@ function HostsView({
     : 0;
   const selectedSshServer = sshServers.find((server) => `ssh:${server.id}` === selectedHost.id);
   const hostIoSeries = filterSeriesByRange(makeHostSeries(selectedHost), historyRange);
+  const initializingSelectedHost = isRemoteInitializing(selectedHost);
 
   return (
     <section className="view-stack">
@@ -1818,18 +2084,31 @@ function HostsView({
           >
             <Server size={15} />
             <span>{displayHostName(host, t)}</span>
-            <small>{host.cpuUsage}% CPU / {formatMemory(host, t)}</small>
+            <small>{isRemoteInitializing(host) ? t("remoteInitializing") : `${host.cpuUsage}% CPU / ${formatMemory(host, t)}`}</small>
           </button>
         ))}
-        <button
-          className="selector-chip add-host-chip"
-          onClick={() => setShowSshForm(true)}
-          title={t("addSshServer")}
-        >
-          <Plus size={18} />
-          <span>{t("addSshServer")}</span>
-          <small>SSH</small>
-        </button>
+        <div className="selector-chip ssh-manage-chip">
+          <button
+            type="button"
+            className="ssh-manage-row add"
+            onClick={() => setShowSshForm(true)}
+            title={t("addSshServer")}
+          >
+            <Plus size={17} />
+            <span>{t("addSshServer")}</span>
+          </button>
+          <button
+            type="button"
+            className="ssh-manage-row clear"
+            onClick={onClearSshServers}
+            disabled={sshServers.length === 0}
+            title={clearSshLabel}
+          >
+            <Trash2 size={15} />
+            <span>{clearSshLabel}</span>
+            <small>{sshServers.length} SSH</small>
+          </button>
+        </div>
       </div>
 
       <div className="host-detail-grid">
@@ -1842,10 +2121,10 @@ function HostsView({
             <ResourceRing value={selectedHost.cpuUsage} label="CPU" />
           </div>
           <div className="host-metric-grid">
-            <HostMetricTile icon={Cpu} label="CPU" value={`${selectedHost.cpuUsage}%`} detail={`${selectedHost.cores.length} ${t("cores")}`} />
+            <HostMetricTile icon={Cpu} label="CPU" value={initializingSelectedHost ? "-" : `${selectedHost.cpuUsage}%`} detail={initializingSelectedHost ? t("remoteInitializing") : `${selectedHost.cores.length} ${t("cores")}`} />
             <HostMetricTile icon={MemoryStick} label={t("memoryLabel")} value={`${memoryPercent}%`} detail={formatMemory(selectedHost, t)} />
             <HostMetricTile icon={Gauge} label={t("gpuUtil")} value={selectedHost.gpusTotal ? `${gpuUtil}%` : "-"} detail={formatGpu(selectedHost, t)} />
-            <HostMetricTile icon={Database} label={t("gpuMemory")} value={gpuMemoryTotal ? `${gbFromMiB(gpuMemoryUsed)} / ${gbFromMiB(gpuMemoryTotal)} GB` : "-"} detail={`${selectedHost.gpusBusy}/${selectedHost.gpusTotal} ${t("runningSuffix")}`} />
+            <HostMetricTile icon={Database} label={t("gpuMemory")} value={gpuMemoryTotal ? `${gbFromMiB(gpuMemoryUsed)} / ${gbFromMiB(gpuMemoryTotal)} GB` : "-"} detail={initializingSelectedHost ? t("remoteInitializing") : `${selectedHost.gpusBusy}/${selectedHost.gpusTotal} ${t("runningSuffix")}`} />
             <HostMetricTile icon={HardDrive} label={t("diskIo")} value={`${(selectedHost.diskRead + selectedHost.diskWrite).toFixed(2)} MB/s`} detail={`${t("read")} ${selectedHost.diskRead} / ${t("write")} ${selectedHost.diskWrite}`} />
             <HostMetricTile icon={Network} label={t("network")} value={`${(selectedHost.netRx + selectedHost.netTx).toFixed(2)} MB/s`} detail={`${t("receive")} ${selectedHost.netRx} / ${t("transmit")} ${selectedHost.netTx}`} />
             <HostMetricTile icon={Workflow} label={t("runsLabel")} value={`${selectedHost.runningRuns}`} detail={`${hostRuns.length} ${t("visibleOnHost")}`} />
@@ -2013,7 +2292,10 @@ function RunsView({
                 {run.metadata?.mark && <em className={`run-mark ${run.metadata.mark}`}>{run.metadata.mark}</em>}
               </span>
               <span><ResourceBadge type={run.resourceType} /></span>
-              <span>{host ? displayHostName(host, t) : run.hostId}</span>
+              <span>
+                {host ? displayHostName(host, t) : run.hostId}
+                <small>{run.hostId}</small>
+              </span>
               <span>{run.rootPid}</span>
               <span>{run.cpuPercent}%</span>
               <span>{run.memoryGb} GB</span>
@@ -2222,11 +2504,13 @@ const PROJECT_TEXT = {
 function ProjectsView({
   projects,
   runs,
+  hosts,
   onOpenRun,
   requestConfirm
 }: {
   projects: Project[];
   runs: Run[];
+  hosts: Host[];
   onOpenRun: (runId: string) => void;
   requestConfirm: (config: PendingConfirm) => void;
 }) {
@@ -2241,6 +2525,7 @@ function ProjectsView({
   const [commitSubject, setCommitSubject] = useState("");
   const [commitBody, setCommitBody] = useState("");
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
+  const hostNameById = useMemo(() => new Map(hosts.map((host) => [host.id, displayHostName(host, (key) => translate(language, key))])), [hosts, language]);
 
   useEffect(() => {
     if (!projects.length) {
@@ -2260,6 +2545,12 @@ function ProjectsView({
     const runIds = new Set(selectedProject.runs);
     return runs.filter((run) => runIds.has(run.id));
   }, [runs, selectedProject]);
+  const runHostLabel = useCallback((run: Run) => hostNameById.get(run.hostId) ?? run.hostId, [hostNameById]);
+  const projectHostLabel = useCallback((project: Project) => {
+    const runIds = new Set(project.runs);
+    const labels = Array.from(new Set(runs.filter((run) => runIds.has(run.id)).map(runHostLabel))).filter(Boolean);
+    return labels.length ? labels.join(", ") : "-";
+  }, [runHostLabel, runs]);
 
   const loadGit = useCallback(() => {
     if (!selectedProject) {
@@ -2448,7 +2739,7 @@ function ProjectsView({
             >
               <strong>{project.name}</strong>
               <span>{project.path}</span>
-              <small>{project.isGit ? labels.gitRepo : labels.noGitRepo} · {project.runningRuns} {labels.running}</small>
+              <small>{project.isGit ? labels.gitRepo : labels.noGitRepo} · {project.runningRuns} {labels.running} · {projectHostLabel(project)}</small>
             </button>
           ))}
         </div>
@@ -2461,6 +2752,7 @@ function ProjectsView({
               <span>{selectedProject.isGit ? labels.gitRepo : labels.noGitRepo}</span>
               <h2>{selectedProject.name}</h2>
               <p>{selectedProject.path}</p>
+              <p>{projectHostLabel(selectedProject)}</p>
             </div>
             <div className="project-stat-strip">
               <Readout label={labels.running} value={String(selectedProject.runningRuns)} />
@@ -2481,6 +2773,7 @@ function ProjectsView({
                 <StatusPill status={run.status} />
                 <span className="project-run-title">
                   <strong>{run.metadata?.pinned ? "★ " : ""}{run.project} / {run.name}</strong>
+                  <small>{runHostLabel(run)}</small>
                   {run.metadata?.mark && <em className={`run-mark ${run.metadata.mark}`}>{run.metadata.mark}</em>}
                 </span>
                 <span>{run.rootPid}</span>
@@ -3348,8 +3641,6 @@ function SshServerPanel({
   const t = useT();
   const [testingId, setTestingId] = useState("");
   const [testResults, setTestResults] = useState<Record<string, SshTestResult>>({});
-  const [resourceLoadingId, setResourceLoadingId] = useState("");
-  const [resourceResults, setResourceResults] = useState<Record<string, SshTestResult>>({});
   const runServerTest = useCallback((server: SshServer) => {
     setTestingId(server.id);
     setTestResults((current) => ({
@@ -3382,33 +3673,6 @@ function SshServerPanel({
   const testServer = (server: SshServer) => {
     runServerTest(server).catch(() => undefined);
   };
-  const refreshRemoteResources = (server: SshServer) => {
-    setResourceLoadingId(server.id);
-    setResourceResults((current) => ({
-      ...current,
-      [server.id]: { ok: false, message: t("loadingRemoteResources") }
-    }));
-    fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/resources`, {
-      method: "POST"
-    })
-      .then(async (response) => {
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          throw new Error(payload.error || `collector ${response.status}`);
-        }
-        return payload as SshTestResult;
-      })
-      .then((payload) => {
-        setResourceResults((current) => ({ ...current, [server.id]: payload }));
-        if (payload.ok && payload.host) {
-          onRemoteHostRefresh(payload.host);
-        }
-      })
-      .catch((error: Error) => {
-        setResourceResults((current) => ({ ...current, [server.id]: { ok: false, error: error.message, message: error.message } }));
-      })
-      .finally(() => setResourceLoadingId(""));
-  };
 
   return (
     <div className="ssh-server-stack">
@@ -3430,15 +3694,6 @@ function SshServerPanel({
                 {testingId === server.id ? t("testingSsh") : t("testSshServer")}
               </button>
               <button
-                className="action-button"
-                disabled={resourceLoadingId === server.id}
-                onClick={() => refreshRemoteResources(server)}
-                title={t("refreshRemoteResources")}
-              >
-                <RefreshCw size={15} />
-                {resourceLoadingId === server.id ? t("loadingRemoteResources") : t("refreshRemoteResources")}
-              </button>
-              <button
                 className="icon-button danger-action"
                 disabled={deletingId === server.id}
                 onClick={() => onDelete(server)}
@@ -3457,20 +3712,24 @@ function SshServerPanel({
           {testResults[server.id] && (
             <SshTestStatus result={testResults[server.id]} />
           )}
-          {resourceResults[server.id] && !resourceResults[server.id].ok && (
-            <SshTestStatus result={resourceResults[server.id]} />
-          )}
         </div>
       ))}
     </div>
   );
 }
 
-function hostFromSshServer(server: SshServer, result?: SshTestResult): Host {
+function hostFromSshServer(server: SshServer, result?: SshTestResult, state: "idle" | "initializing" | "failed" = "idle"): Host {
+  const warnings = state === "initializing"
+    ? ["remote initializing"]
+    : state === "failed"
+      ? [result?.message || result?.error || "remote resource load failed"]
+      : result?.ok
+        ? []
+        : ["remote resources not loaded"];
   return {
     id: `ssh:${server.id}`,
     name: server.name || result?.hostname || server.host,
-    os: result?.hostname ? `SSH / ${result.hostname}` : "SSH",
+    os: result?.remoteOs ? `SSH / ${result.remoteOs}` : result?.hostname ? `SSH / ${result.hostname}` : "SSH",
     address: server.host,
     user: server.username,
     cpuUsage: 0,
@@ -3484,7 +3743,7 @@ function hostFromSshServer(server: SshServer, result?: SshTestResult): Host {
     netRx: 0,
     netTx: 0,
     runningRuns: 0,
-    warnings: result?.ok ? [] : ["Remote resources not loaded"],
+    warnings,
     cores: [],
     history: []
   };
@@ -3527,11 +3786,11 @@ function SshServerDialog({
     event.preventDefault();
     setTestResult(null);
     onSave(form)
-      .then(({ test }) => {
+      .then(({ server, test }) => {
         if (test) {
           setTestResult(test);
         }
-        if (test?.ok) {
+        if (server) {
           onClose();
         }
       })
@@ -3620,6 +3879,8 @@ function SshTestStatus({ result }: { result: SshTestResult }) {
   const label = result.ok ? t("sshTestOk") : result.supported === false ? t("sshTestUnsupported") : t("sshTestFailed");
   const detail = [
     result.hostname,
+    result.remoteOs ? `OS ${result.remoteOs}` : "",
+    result.pythonPath ? `Python ${result.pythonPath}` : "",
     typeof result.latencyMs === "number" ? `${t("latency")} ${result.latencyMs} ms` : "",
     result.testedAt
   ].filter(Boolean).join(" · ");
@@ -4050,6 +4311,9 @@ function displayHostName(host: Host | undefined, t: (key: TextKey) => string) {
 }
 
 function formatMemory(host: Host, t: (key: TextKey) => string) {
+  if (isRemoteInitializing(host)) {
+    return t("remoteInitializing");
+  }
   return host.memoryTotalGb > 0 ? `${host.memoryUsedGb}/${host.memoryTotalGb} GB` : t("notConnected");
 }
 
@@ -4060,6 +4324,15 @@ function formatHostWarning(warning: string | undefined, t: (key: TextKey) => str
   if (warning.toLowerCase() === "collector offline") {
     return t("notConnected");
   }
+  if (warning.toLowerCase() === "remote initializing") {
+    return t("remoteInitializing");
+  }
+  if (warning.toLowerCase() === "remote resources not loaded") {
+    return t("remoteResourcesNotLoaded");
+  }
+  if (warning.toLowerCase() === "remote resource load failed") {
+    return t("remoteResourceLoadFailed");
+  }
   return warning;
 }
 
@@ -4068,7 +4341,14 @@ function gbFromMiB(value: number) {
 }
 
 function formatGpu(host: Host, t: (key: TextKey) => string) {
+  if (isRemoteInitializing(host)) {
+    return t("remoteInitializing");
+  }
   return host.gpusTotal > 0 ? `${host.gpusBusy}/${host.gpusTotal} ${t("runningSuffix")}` : t("notDetected");
+}
+
+function isRemoteInitializing(host: Host) {
+  return host.warnings.some((warning) => warning.toLowerCase() === "remote initializing");
 }
 
 function shortGpuUuid(uuid: string) {

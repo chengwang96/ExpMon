@@ -104,6 +104,23 @@ def main() -> None:
                 assert payload["ok"] is False, payload
                 assert payload["supported"] is False, payload
 
+            status, payload = local_collector.validate_and_save_ssh_server({
+                "name": "offline-remote",
+                "host": "192.0.2.10",
+                "port": 22,
+                "username": "tester",
+                "authType": "password",
+                "password": "secret",
+            })
+            assert status == 200, payload
+            assert payload["ok"] is True, payload
+            assert payload["test"]["ok"] is False, payload
+            assert any(server["name"] == "offline-remote" for server in local_collector.read_ssh_servers_raw())
+
+            status, payload = local_collector.clear_ssh_servers()
+            assert status == 200, payload
+            assert local_collector.read_ssh_servers_raw() == []
+
         print("PASS: collector project root checks")
     finally:
         local_collector.CONFIG = original_config

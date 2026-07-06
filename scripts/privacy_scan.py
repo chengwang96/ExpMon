@@ -31,7 +31,9 @@ SKIP_SUFFIXES = {
     ".zip",
     ".gz",
     ".tar",
+    ".log",
     ".lock",
+    ".err.log",
     ".tsbuildinfo",
 }
 
@@ -56,7 +58,9 @@ PATTERNS = {
     "local_python_env": re.compile(r"\b(?:anaconda|miniconda)\b", re.IGNORECASE),
 }
 
-ALLOWLIST: dict[str, set[str]] = {}
+ALLOWLIST: dict[str, set[str]] = {
+    "scripts/local_collector.py": {"anaconda", "miniconda"},
+}
 
 
 def should_scan(path: Path) -> bool:
