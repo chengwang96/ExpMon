@@ -345,14 +345,15 @@ def ssh_key_candidates() -> list[str]:
 
 
 def ssh_servers_payload() -> dict[str, Any]:
+    servers = dedupe_ssh_servers(read_ssh_servers_raw())
     return {
-        "servers": [public_ssh_server(server) for server in read_ssh_servers_raw()],
+        "servers": [public_ssh_server(server) for server in servers],
         "keyCandidates": ssh_key_candidates(),
         "storagePath": str(SSH_SERVERS_PATH),
     }
 
 
-def save_ssh_server(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+def save_ssh_server(payload: dict[str, Any], persist: bool = True) -> tuple[int, dict[str, Any]]:
     host = str(payload.get("host") or "").strip()
     username = str(payload.get("username") or "").strip()
     auth_type = str(payload.get("authType") or "key").strip().lower()
@@ -378,9 +379,20 @@ def save_ssh_server(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         return 400, {"ok": False, "error": "password is required for password auth"}
 
     now = datetime.now().isoformat(timespec="seconds")
-    servers = read_ssh_servers_raw()
+    servers = dedupe_ssh_servers(read_ssh_servers_raw())
     server_id = str(payload.get("id") or uuid.uuid4().hex[:12])
     existing = next((server for server in servers if str(server.get("id")) == server_id), None)
+    duplicate = next((
+        server for server in servers
+        if str(server.get("id")) != server_id
+        and ssh_server_key(server) == (host.lower(), username.lower(), port)
+    ), None)
+    if duplicate:
+        return 409, {
+            "ok": False,
+            "error": "ssh server already exists",
+            "server": public_ssh_server(duplicate),
+        }
     next_doc = {
         "id": server_id,
         "name": name or host,
@@ -397,17 +409,64 @@ def save_ssh_server(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         servers = [next_doc if str(server.get("id")) == server_id else server for server in servers]
     else:
         servers.append(next_doc)
-    write_ssh_servers_raw(servers)
-    return 200, {"ok": True, "server": public_ssh_server(next_doc), "storagePath": str(SSH_SERVERS_PATH)}
+    if persist:
+        write_ssh_servers_raw(servers)
+        return 200, {"ok": True, "server": public_ssh_server(next_doc), "storagePath": str(SSH_SERVERS_PATH)}
+    return 200, {
+        "ok": True,
+        "server": public_ssh_server(next_doc),
+        "serverDoc": next_doc,
+        "servers": servers,
+        "storagePath": str(SSH_SERVERS_PATH),
+    }
+
+
+def validate_and_save_ssh_server(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    status, saved = save_ssh_server(payload, persist=False)
+    if status != 200:
+        return status, saved
+    server = saved.get("serverDoc")
+    if not isinstance(server, dict):
+        return 500, {"ok": False, "error": "failed to prepare ssh server"}
+    test_payload = test_ssh_server_doc(server)
+    if not test_payload.get("ok"):
+        return 400, {"ok": False, "error": test_payload.get("message") or "ssh connection failed", "test": test_payload}
+    write_ssh_servers_raw(saved.get("servers", []))
+    return 200, {
+        "ok": True,
+        "server": public_ssh_server(server),
+        "test": test_payload,
+        "storagePath": str(SSH_SERVERS_PATH),
+    }
 
 
 def delete_ssh_server(server_id: str) -> tuple[int, dict[str, Any]]:
-    servers = read_ssh_servers_raw()
+    servers = dedupe_ssh_servers(read_ssh_servers_raw())
     next_servers = [server for server in servers if str(server.get("id")) != server_id]
     if len(next_servers) == len(servers):
         return 404, {"ok": False, "error": "ssh server not found"}
     write_ssh_servers_raw(next_servers)
     return 200, {"ok": True, "serverId": server_id}
+
+
+def ssh_server_key(server: dict[str, Any]) -> tuple[str, str, int]:
+    return (
+        str(server.get("host") or "").strip().lower(),
+        str(server.get("username") or "").strip().lower(),
+        int(server.get("port") or 22),
+    )
+
+
+def dedupe_ssh_servers(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, int]] = set()
+    deduped = []
+    for server in servers:
+        key = ssh_server_key(server)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(server)
+    return deduped
 
 
 def ssh_server_by_id(server_id: str) -> dict[str, Any] | None:
@@ -460,16 +519,12 @@ def ssh_command_for_server(server: dict[str, Any], remote_command: str) -> tuple
     return command, None
 
 
-def test_ssh_server(server_id: str) -> tuple[int, dict[str, Any]]:
-    server = ssh_server_by_id(server_id)
-    if not server:
-        return 404, {"ok": False, "error": "ssh server not found"}
-
+def test_ssh_server_doc(server: dict[str, Any]) -> dict[str, Any]:
     command, error_payload = ssh_command_for_server(server, "echo EXPMON_SSH_OK && hostname")
     if error_payload:
-        return 400 if error_payload.get("error") else 200, error_payload
+        return error_payload
     if not command:
-        return 500, {"ok": False, "error": "failed to build ssh command", "server": public_ssh_server(server)}
+        return {"ok": False, "error": "failed to build ssh command", "server": public_ssh_server(server)}
 
     started = time.time()
     try:
@@ -482,7 +537,7 @@ def test_ssh_server(server_id: str) -> tuple[int, dict[str, Any]]:
             timeout=12,
         )
     except subprocess.TimeoutExpired:
-        return 200, {
+        return {
             "ok": False,
             "supported": True,
             "server": public_ssh_server(server),
@@ -496,7 +551,7 @@ def test_ssh_server(server_id: str) -> tuple[int, dict[str, Any]]:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     ok = completed.returncode == 0 and "EXPMON_SSH_OK" in lines
     hostname = next((line for line in lines if line != "EXPMON_SSH_OK"), "")
-    return 200, {
+    return {
         "ok": ok,
         "supported": True,
         "server": public_ssh_server(server),
@@ -507,6 +562,14 @@ def test_ssh_server(server_id: str) -> tuple[int, dict[str, Any]]:
         "stderr": stderr[:2000],
         "message": "ssh connection ok" if ok else (stderr or stdout or f"ssh exited with {completed.returncode}"),
     }
+
+
+def test_ssh_server(server_id: str) -> tuple[int, dict[str, Any]]:
+    server = ssh_server_by_id(server_id)
+    if not server:
+        return 404, {"ok": False, "error": "ssh server not found"}
+
+    return 200, test_ssh_server_doc(server)
 
 
 REMOTE_RESOURCE_SCRIPT = r"""
@@ -2928,7 +2991,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path == "/api/ssh/servers":
-            status, payload = save_ssh_server(read_json_body(self))
+            status, payload = validate_and_save_ssh_server(read_json_body(self))
             self.send_json(payload, status=status)
             return
         if path == "/api/config":

@@ -161,6 +161,7 @@ type SshServerForm = {
 
 type SshSaveResult = {
   server?: SshServer;
+  test?: SshTestResult;
   storagePath?: string;
 };
 
@@ -990,12 +991,22 @@ function App() {
       .then(async (response) => {
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
-          throw new Error(payload.error || `collector ${response.status}`);
+          if (payload.test) {
+            throw Object.assign(new Error(payload.error || payload.test.message || `collector ${response.status}`), {
+              test: payload.test
+            });
+          }
+          throw new Error(payload.error === "ssh server already exists"
+            ? (language === "zh" ? "SSH 服务器已存在" : "SSH server already exists")
+            : (payload.error || `collector ${response.status}`));
         }
         return payload as SshSaveResult;
       })
       .then((payload) => {
         setOperationMessage(language === "zh" ? "SSH 服务器已保存" : "SSH server saved");
+        if (payload.server && payload.test?.ok) {
+          handleRemoteHostRefresh(hostFromSshServer(payload.server, payload.test));
+        }
         refreshSnapshot();
         return payload;
       })
@@ -1793,6 +1804,7 @@ function HostsView({
   const gpuUtil = selectedHost.gpus?.length
     ? Math.round(selectedHost.gpus.reduce((total, gpu) => total + (gpu.utilization ?? 0), 0) / selectedHost.gpus.length)
     : 0;
+  const selectedSshServer = sshServers.find((server) => `ssh:${server.id}` === selectedHost.id);
   const hostIoSeries = filterSeriesByRange(makeHostSeries(selectedHost), historyRange);
 
   return (
@@ -1842,19 +1854,17 @@ function HostsView({
           <HostGpuPanel host={selectedHost} />
         </div>
 
-        <div className="panel">
-          <PanelTitle icon={Server} title={t("sshServers")} />
-          <SshServerPanel
-            host={selectedHost}
-            servers={sshServers}
-            keyCandidates={sshKeyCandidates}
-            onSave={onSaveSshServer}
-            onDelete={onDeleteSshServer}
-            onRemoteHostRefresh={onRemoteHostRefresh}
-            saving={sshSaveInFlight}
-            deletingId={sshDeleteInFlight}
-          />
-        </div>
+        {selectedSshServer && (
+          <div className="panel">
+            <PanelTitle icon={Server} title={t("sshServers")} />
+            <SshServerPanel
+              servers={[selectedSshServer]}
+              onDelete={onDeleteSshServer}
+              onRemoteHostRefresh={onRemoteHostRefresh}
+              deletingId={sshDeleteInFlight}
+            />
+          </div>
+        )}
 
         <div className="panel">
           <PanelTitle icon={Cpu} title={t("perCoreCpu")} />
@@ -1911,6 +1921,7 @@ function HostsView({
       {showSshForm && (
         <SshServerDialog
           keyCandidates={sshKeyCandidates}
+          defaultUsername={hosts[0]?.user ?? ""}
           onSave={onSaveSshServer}
           onRemoteHostRefresh={onRemoteHostRefresh}
           onClose={() => setShowSshForm(false)}
@@ -3324,22 +3335,14 @@ function HostGpuPanel({ host }: { host: Host }) {
 }
 
 function SshServerPanel({
-  host,
   servers,
-  keyCandidates,
-  onSave,
   onDelete,
   onRemoteHostRefresh,
-  saving,
   deletingId
 }: {
-  host: Host;
   servers: SshServer[];
-  keyCandidates: string[];
-  onSave: (form: SshServerForm) => Promise<SshSaveResult>;
   onDelete: (server: SshServer) => void;
   onRemoteHostRefresh: (host: Host) => void;
-  saving: boolean;
   deletingId: string;
 }) {
   const t = useT();
@@ -3409,22 +3412,6 @@ function SshServerPanel({
 
   return (
     <div className="ssh-server-stack">
-      <div className="ssh-server-card active">
-        <div>
-          <strong>{displayHostName(host, t)}</strong>
-          <span>{host.user}@{host.address}</span>
-        </div>
-        <div className="ssh-capability-grid">
-          <Readout label="OS" value={host.os} />
-          <Readout label="CPU" value={`${host.cpuUsage}% / ${host.cores.length} ${t("cores")}`} />
-          <Readout label={t("memoryLabel")} value={formatMemory(host, t)} />
-          <Readout label="GPU" value={formatGpu(host, t)} />
-          <Readout label={t("diskIo")} value={`${host.diskRead}/${host.diskWrite} MB/s`} />
-          <Readout label={t("network")} value={`${host.netRx}/${host.netTx} MB/s`} />
-          <Readout label={t("runsLabel")} value={`${host.runningRuns} ${t("runningSuffix")}`} />
-          <Readout label={t("warnings")} value={formatHostWarning(host.warnings[0], t) ?? t("normal")} />
-        </div>
-      </div>
       {servers.map((server) => (
         <div key={server.id} className="ssh-server-card">
           <div className="ssh-server-card-top">
@@ -3505,12 +3492,14 @@ function hostFromSshServer(server: SshServer, result?: SshTestResult): Host {
 
 function SshServerDialog({
   keyCandidates,
+  defaultUsername,
   onSave,
   onRemoteHostRefresh,
   onClose,
   saving
 }: {
   keyCandidates: string[];
+  defaultUsername: string;
   onSave: (form: SshServerForm) => Promise<SshSaveResult>;
   onRemoteHostRefresh: (host: Host) => void;
   onClose: () => void;
@@ -3521,7 +3510,7 @@ function SshServerDialog({
     name: "",
     host: "",
     port: 22,
-    username: "",
+    username: defaultUsername,
     authType: "key",
     keyPath: keyCandidates[0] ?? "",
     password: ""
@@ -3538,35 +3527,19 @@ function SshServerDialog({
     event.preventDefault();
     setTestResult(null);
     onSave(form)
-      .then(({ server }) => {
-        if (!server) {
+      .then(({ test }) => {
+        if (test) {
+          setTestResult(test);
+        }
+        if (test?.ok) {
+          onClose();
+        }
+      })
+      .catch((error: Error & { test?: SshTestResult }) => {
+        if (error.test) {
+          setTestResult(error.test);
           return;
         }
-        setTesting(true);
-        setTestResult({ ok: false, message: t("testingSsh") });
-        return fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/test`, {
-          method: "POST"
-        })
-          .then(async (response) => {
-            const payload = await response.json().catch(() => ({}));
-            if (!response.ok) {
-              throw new Error(payload.error || `collector ${response.status}`);
-            }
-            return payload as SshTestResult;
-          })
-          .then((payload) => {
-            setTestResult(payload);
-            if (payload.ok) {
-              onRemoteHostRefresh(hostFromSshServer(server, payload));
-              onClose();
-            }
-          })
-          .catch((error: Error) => {
-            setTestResult({ ok: false, error: error.message, message: error.message });
-          })
-          .finally(() => setTesting(false));
-      })
-      .catch((error: Error) => {
         setTestResult({ ok: false, error: error.message, message: error.message });
       });
   };
