@@ -439,7 +439,6 @@ def ssh_command_for_server(server: dict[str, Any], remote_command: str) -> tuple
     username = str(server.get("username") or "")
     port = str(int(server.get("port") or 22))
     target = f"{username}@{host}"
-    remote_command = "echo EXPMON_SSH_OK && hostname"
     command = [
         ssh_binary,
         "-p",

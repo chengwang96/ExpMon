@@ -815,6 +815,7 @@ function App() {
     runs: initialRuns,
     connected: false
   });
+  const [remoteHosts, setRemoteHosts] = useState<Host[]>([]);
   const [selectedRunId, setSelectedRunId] = useState(initialRuns[0]?.id ?? "");
   const [selectedHostId, setSelectedHostId] = useState(initialHosts[0].id);
   const [query, setQuery] = useState("");
@@ -1012,6 +1013,7 @@ function App() {
         }
       })
       .then(() => {
+        setRemoteHosts((current) => current.filter((host) => host.id !== `ssh:${server.id}`));
         setOperationMessage(language === "zh" ? "SSH 服务器已删除" : "SSH server deleted");
         refreshSnapshot();
       })
@@ -1089,7 +1091,27 @@ function App() {
       .finally(() => setConfigSaveInFlight(false));
   }, [language, refreshSnapshot]);
 
-  const hosts = snapshot.hosts;
+  const handleRemoteHostRefresh = useCallback((host: Host) => {
+    setRemoteHosts((current) => {
+      const next = current.filter((item) => item.id !== host.id);
+      return [...next, host];
+    });
+    setSelectedHostId(host.id);
+    setActiveView("hosts");
+  }, []);
+
+  const hosts = useMemo(() => {
+    const merged = [...snapshot.hosts];
+    remoteHosts.forEach((remoteHost) => {
+      const index = merged.findIndex((host) => host.id === remoteHost.id);
+      if (index >= 0) {
+        merged[index] = remoteHost;
+      } else {
+        merged.push(remoteHost);
+      }
+    });
+    return merged;
+  }, [remoteHosts, snapshot.hosts]);
   const runs = snapshot.runs;
   useEffect(() => {
     if (runs.length && !runs.some((run) => run.id === selectedRunId)) {
@@ -1217,6 +1239,7 @@ function App() {
             onSelectHost={setSelectedHostId}
             onSaveSshServer={saveSshServer}
             onDeleteSshServer={deleteSshServer}
+            onRemoteHostRefresh={handleRemoteHostRefresh}
             sshSaveInFlight={sshSaveInFlight}
             sshDeleteInFlight={sshDeleteInFlight}
           />
@@ -1730,6 +1753,7 @@ function HostsView({
   onSelectHost,
   onSaveSshServer,
   onDeleteSshServer,
+  onRemoteHostRefresh,
   sshSaveInFlight,
   sshDeleteInFlight
 }: {
@@ -1741,6 +1765,7 @@ function HostsView({
   onSelectHost: (hostId: string) => void;
   onSaveSshServer: (form: SshServerForm) => void;
   onDeleteSshServer: (server: SshServer) => void;
+  onRemoteHostRefresh: (host: Host) => void;
   sshSaveInFlight: boolean;
   sshDeleteInFlight: string;
 }) {
@@ -1807,6 +1832,7 @@ function HostsView({
             keyCandidates={sshKeyCandidates}
             onSave={onSaveSshServer}
             onDelete={onDeleteSshServer}
+            onRemoteHostRefresh={onRemoteHostRefresh}
             saving={sshSaveInFlight}
             deletingId={sshDeleteInFlight}
           />
@@ -3276,6 +3302,7 @@ function SshServerPanel({
   keyCandidates,
   onSave,
   onDelete,
+  onRemoteHostRefresh,
   saving,
   deletingId
 }: {
@@ -3284,6 +3311,7 @@ function SshServerPanel({
   keyCandidates: string[];
   onSave: (form: SshServerForm) => void;
   onDelete: (server: SshServer) => void;
+  onRemoteHostRefresh: (host: Host) => void;
   saving: boolean;
   deletingId: string;
 }) {
@@ -3353,6 +3381,9 @@ function SshServerPanel({
       })
       .then((payload) => {
         setResourceResults((current) => ({ ...current, [server.id]: payload }));
+        if (payload.ok && payload.host) {
+          onRemoteHostRefresh(payload.host);
+        }
       })
       .catch((error: Error) => {
         setResourceResults((current) => ({ ...current, [server.id]: { ok: false, error: error.message, message: error.message } }));
@@ -3423,8 +3454,8 @@ function SshServerPanel({
           {testResults[server.id] && (
             <SshTestStatus result={testResults[server.id]} />
           )}
-          {resourceResults[server.id] && (
-            <SshResourceSnapshot result={resourceResults[server.id]} />
+          {resourceResults[server.id] && !resourceResults[server.id].ok && (
+            <SshTestStatus result={resourceResults[server.id]} />
           )}
         </div>
       ))}
@@ -3496,30 +3527,6 @@ function SshTestStatus({ result }: { result: SshTestResult }) {
       <strong>{label}</strong>
       {detail && <span>{detail}</span>}
       {(result.message || result.error) && <em>{result.message || result.error}</em>}
-    </div>
-  );
-}
-
-function SshResourceSnapshot({ result }: { result: SshTestResult }) {
-  const t = useT();
-  const host = result.host;
-  if (!result.ok || !host) {
-    return <SshTestStatus result={result} />;
-  }
-  return (
-    <div className="ssh-resource-snapshot">
-      <div className="ssh-resource-head">
-        <strong>{t("remoteResourceSnapshot")}</strong>
-        <span>{result.sampledAt ?? result.testedAt ?? ""}{typeof result.latencyMs === "number" ? ` · ${t("latency")} ${result.latencyMs} ms` : ""}</span>
-      </div>
-      <div className="ssh-capability-grid">
-        <Readout label={t("host")} value={displayHostName(host, t)} />
-        <Readout label="OS" value={host.os} />
-        <Readout label="CPU" value={`${host.cpuUsage}% / ${host.cores.length || "-"} ${t("cores")}`} />
-        <Readout label={t("memoryLabel")} value={formatMemory(host, t)} />
-        <Readout label="GPU" value={formatGpu(host, t)} />
-        <Readout label={t("gpuUtil")} value={host.gpus?.length ? `${averageGpuUtilPercent(host)}%` : t("notDetected")} />
-      </div>
     </div>
   );
 }
