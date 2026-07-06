@@ -56,6 +56,24 @@ def main() -> None:
             explicit = local_collector.detect_project("python special_train.py", str(run_cwd))
             assert explicit == "ExplicitProject", explicit
 
+            stale_run_dir = workspace / "expmon-runs" / "ExperimentA" / "stale-running"
+            stale_run_dir.mkdir(parents=True)
+            local_collector.write_yaml(stale_run_dir / "manifest.yaml", {
+                "schema_version": "expmon.v1",
+                "run": {"run_id": "stale-running", "project": "ExperimentA", "name": "stale-running"},
+                "host": {"host_id": "local"},
+                "entrypoint": {"command": "python train.py", "cwd": str(run_cwd)},
+                "process": {"root_pid": 999999999, "root_create_time": 1.0},
+                "time": {"started_at": "2026-01-01T00:00:00"},
+            })
+            local_collector.write_json(stale_run_dir / "status.json", {
+                "status": "running",
+                "pid": 999999999,
+                "started_at": "2026-01-01T00:00:00",
+            })
+            stale_run = local_collector.run_from_manifest(stale_run_dir, [])
+            assert stale_run and stale_run["status"] == "finished", stale_run
+
             assert local_collector.safe_git_relative_path("src/App.tsx")
             assert local_collector.safe_git_relative_path("docs/run protocol.md")
             assert not local_collector.safe_git_relative_path("")

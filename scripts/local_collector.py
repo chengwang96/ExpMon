@@ -2650,6 +2650,7 @@ def run_from_manifest(run_dir: Path, gpus: list[dict[str, Any]]) -> dict[str, An
     root_create_time = process_doc.get("root_create_time")
     status = str(status_doc.get("status") or run_doc.get("status") or "unknown")
     alive = process_is_alive(root_pid, root_create_time)
+    stale_running_record = status == "running" and not alive
     if alive:
         status = "running"
         try:
@@ -2664,6 +2665,8 @@ def run_from_manifest(run_dir: Path, gpus: list[dict[str, Any]]) -> dict[str, An
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             live_run = None
     else:
+        if stale_running_record:
+            status = "finished"
         live_run = None
 
     started_at = str(time_doc.get("started_at") or status_doc.get("started_at") or "")

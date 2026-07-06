@@ -182,6 +182,10 @@ textarea:focus-visible {
   .collector-pulse span {
     animation: none;
   }
+
+  .refresh-button.is-refreshing svg {
+    animation: none;
+  }
 }
 
 .workspace {
@@ -304,6 +308,30 @@ h3 {
 
 .icon-button {
   width: 42px;
+}
+
+.refresh-button {
+  position: relative;
+  overflow: hidden;
+}
+
+.refresh-button svg {
+  transition: transform 160ms ease, color 160ms ease;
+}
+
+.refresh-button.is-refreshing {
+  border-color: rgba(19, 138, 126, 0.42);
+  color: var(--cyan);
+  background: rgba(19, 138, 126, 0.08);
+  box-shadow: 0 0 0 4px rgba(19, 138, 126, 0.08);
+}
+
+.refresh-button.is-refreshing svg {
+  animation: refresh-spin 650ms linear infinite;
+}
+
+@keyframes refresh-spin {
+  to { transform: rotate(360deg); }
 }
 
 .action-button {

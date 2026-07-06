@@ -36,6 +36,12 @@ SKIP_SUFFIXES = {
 }
 
 SKIP_FILES = {
+    ".env",
+    ".env.local",
+    "expmon-local.yaml",
+    "expmon-local.yml",
+    "expmon-run-metadata.json",
+    "expmon-ssh-servers.json",
     "scripts/privacy_scan.py",
 }
 

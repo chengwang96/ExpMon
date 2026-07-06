@@ -820,6 +820,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [resourceFilter, setResourceFilter] = useState<ResourceType | "all">("all");
   const [lastRefreshAt, setLastRefreshAt] = useState(() => new Date());
+  const [manualRefreshInFlight, setManualRefreshInFlight] = useState(false);
   const [operationMessage, setOperationMessage] = useState("");
   const [killInFlight, setKillInFlight] = useState("");
   const [deleteInFlight, setDeleteInFlight] = useState("");
@@ -835,7 +836,7 @@ function App() {
   }, []);
 
   const refreshSnapshot = useCallback(() => {
-    fetch(`${API_BASE}/api/snapshot`, { cache: "no-store" })
+    return fetch(`${API_BASE}/api/snapshot`, { cache: "no-store" })
       .then((response) => {
         if (!response.ok) {
           throw new Error(`collector ${response.status}`);
@@ -865,6 +866,16 @@ function App() {
         setLastRefreshAt(new Date());
       });
   }, []);
+
+  const handleManualRefresh = useCallback(() => {
+    setManualRefreshInFlight(true);
+    const startedAt = window.performance.now();
+    refreshSnapshot().finally(() => {
+      const elapsed = window.performance.now() - startedAt;
+      const remaining = Math.max(0, 520 - elapsed);
+      window.setTimeout(() => setManualRefreshInFlight(false), remaining);
+    });
+  }, [refreshSnapshot]);
 
   useEffect(() => {
     refreshSnapshot();
@@ -1166,7 +1177,13 @@ function App() {
               <button className={language === "en" ? "active" : ""} onClick={() => setLanguage("en")}>EN</button>
               <button className={language === "zh" ? "active" : ""} onClick={() => setLanguage("zh")}>中文</button>
             </div>
-            <button className="icon-button" title={t("refresh")} onClick={refreshSnapshot}>
+            <button
+              className={`icon-button refresh-button${manualRefreshInFlight ? " is-refreshing" : ""}`}
+              title={t("refresh")}
+              aria-label={t("refresh")}
+              aria-busy={manualRefreshInFlight}
+              onClick={handleManualRefresh}
+            >
               <RefreshCw size={17} />
             </button>
             <span className="refresh-indicator">

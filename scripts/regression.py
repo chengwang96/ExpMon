@@ -34,6 +34,11 @@ def main() -> None:
         expect(page.locator("nav.nav-list").get_by_role("button", name="Run Detail")).to_have_count(0)
         note("PASS: default English dashboard and sidebar shape")
 
+        refresh_button = page.get_by_role("button", name="Refresh")
+        refresh_button.click()
+        expect(refresh_button).to_have_class(re.compile(r"\bis-refreshing\b"))
+        note("PASS: manual refresh animation state")
+
         page.get_by_role("button", name="中文").click()
         expect(page.get_by_role("heading", name="资源总览")).to_be_visible()
         expect(page.get_by_text("Resource Dashboard")).to_have_count(0)
