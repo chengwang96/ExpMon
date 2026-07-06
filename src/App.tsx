@@ -1665,82 +1665,80 @@ function Dashboard({
 
       <ResourceOverview host={hosts[0]} />
 
-      <div className="dashboard-layout">
-        <div className="dashboard-column">
-          <div className="panel host-mix-panel">
-            <PanelTitle icon={BarChart3} title={t("hostResourceMix")} />
-            <div className="host-mix-list">
-              {hosts.map((host) => (
-                <button key={host.id} className="host-mix-card" onClick={() => onOpenHost(host.id)}>
-                  <div className="host-mix-head">
-                    <strong>{displayHostName(host, t)}</strong>
-                    <span>{host.runningRuns} {t("runningSuffix")}</span>
-                  </div>
-                  <div className="host-mix-meter-grid">
-                    {hostMixRows(host, t).map((row) => (
-                      <div key={row.label} className={`host-mix-meter ${row.accent}`}>
-                        <div>
-                          <span>{row.label}</span>
-                          <strong>{row.detail}</strong>
-                        </div>
-                        <i><b style={{ width: `${clampPercent(row.value)}%` }} /></i>
+      <div className="dashboard-top">
+        <div className="panel host-mix-panel">
+          <PanelTitle icon={BarChart3} title={t("hostResourceMix")} />
+          <div className="host-mix-list">
+            {hosts.map((host) => (
+              <button key={host.id} className="host-mix-card" onClick={() => onOpenHost(host.id)}>
+                <div className="host-mix-head">
+                  <strong>{displayHostName(host, t)}</strong>
+                  <span>{host.runningRuns} {t("runningSuffix")}</span>
+                </div>
+                <div className="host-mix-meter-grid">
+                  {hostMixRows(host, t).map((row) => (
+                    <div key={row.label} className={`host-mix-meter ${row.accent}`}>
+                      <div>
+                        <span>{row.label}</span>
+                        <strong>{row.detail}</strong>
                       </div>
-                    ))}
-                  </div>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="panel dashboard-host-panel">
-            <PanelTitle icon={Server} title={t("hosts")} />
-            <div className="dashboard-host-grid">
-              {hosts.map((host) => (
-                <button key={host.id} className="host-tile" onClick={() => onOpenHost(host.id)}>
-                  <div className="host-tile-top">
-                    <span>{displayHostName(host, t)}</span>
-                    {host.warnings.length ? <AlertTriangle size={16} /> : <Activity size={16} />}
-                  </div>
-                  <div className="host-readouts">
-                    <Readout label="CPU" value={`${host.cpuUsage}%`} />
-                    <Readout label={t("memoryLabel")} value={formatMemory(host, t)} />
-                    <Readout label="GPU" value={formatGpu(host, t)} />
-                    <Readout label={t("runsLabel")} value={`${host.runningRuns} ${t("runningSuffix")}`} />
-                  </div>
-                  <div className="warning-line">{formatHostWarning(host.warnings[0], t) ?? t("normal")}</div>
-                </button>
-              ))}
-            </div>
+                      <i><b style={{ width: `${clampPercent(row.value)}%` }} /></i>
+                    </div>
+                  ))}
+                </div>
+              </button>
+            ))}
           </div>
         </div>
 
-        <div className="dashboard-column">
-          <div className="panel run-queue">
-            <PanelTitle icon={Workflow} title={t("activeRuns")} />
-            <div className="run-stack">
-              {activeRuns.length ? activeRuns.map((run) => (
-                <button key={run.id} className="run-strip" onClick={() => onOpenRun(run.id)}>
-                  <span className={`status-dot ${run.status}`} />
-                  <span>
-                    <strong>{run.project}</strong>
-                    <small>{run.name}</small>
-                  </span>
-                  <ResourceBadge type={run.resourceType} />
-                  <em>{run.cpuPercent}% CPU · {formatGpuRunUsage(run, t)}</em>
-                </button>
-              )) : (
-                <EmptyPanel
-                  title={t("noExperimentTasks")}
-                  body={t("noExperimentTasksBody")}
-                />
-              )}
-            </div>
+        <div className="panel dashboard-host-panel">
+          <PanelTitle icon={Server} title={t("hosts")} />
+          <div className="dashboard-host-grid">
+            {hosts.map((host) => (
+              <button key={host.id} className="host-tile" onClick={() => onOpenHost(host.id)}>
+                <div className="host-tile-top">
+                  <span>{displayHostName(host, t)}</span>
+                  {host.warnings.length ? <AlertTriangle size={16} /> : <Activity size={16} />}
+                </div>
+                <div className="host-readouts">
+                  <Readout label="CPU" value={`${host.cpuUsage}%`} />
+                  <Readout label={t("memoryLabel")} value={formatMemory(host, t)} />
+                  <Readout label="GPU" value={formatGpu(host, t)} />
+                  <Readout label={t("runsLabel")} value={`${host.runningRuns} ${t("runningSuffix")}`} />
+                </div>
+                <div className="warning-line">{formatHostWarning(host.warnings[0], t) ?? t("normal")}</div>
+              </button>
+            ))}
           </div>
+        </div>
+      </div>
 
-          <div className="panel run-queue">
-            <PanelTitle icon={AlertTriangle} title={language === "zh" ? "洞察" : "Insights"} />
-            <DiagnosticList diagnostics={diagnostics} onOpenRun={onOpenRun} />
+      <div className="dashboard-bottom">
+        <div className="panel run-queue">
+          <PanelTitle icon={Workflow} title={t("activeRuns")} />
+          <div className="run-stack">
+            {activeRuns.length ? activeRuns.map((run) => (
+              <button key={run.id} className="run-strip" onClick={() => onOpenRun(run.id)}>
+                <span className={`status-dot ${run.status}`} />
+                <span>
+                  <strong>{run.project}</strong>
+                  <small>{run.name}</small>
+                </span>
+                <ResourceBadge type={run.resourceType} />
+                <em>{run.cpuPercent}% CPU · {formatGpuRunUsage(run, t)}</em>
+              </button>
+            )) : (
+              <EmptyPanel
+                title={t("noExperimentTasks")}
+                body={t("noExperimentTasksBody")}
+              />
+            )}
           </div>
+        </div>
+
+        <div className="panel run-queue">
+          <PanelTitle icon={AlertTriangle} title={language === "zh" ? "洞察" : "Insights"} />
+          <DiagnosticList diagnostics={diagnostics} onOpenRun={onOpenRun} />
         </div>
       </div>
     </section>
