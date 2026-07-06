@@ -1799,8 +1799,21 @@ h3 {
   flex-direction: column;
 }
 
-.selector-chip svg {
-  align-self: flex-start;
+.selector-chip.add-host-chip {
+  min-width: 112px;
+  border-style: dashed;
+  border-color: rgba(19, 138, 126, 0.35);
+  color: var(--cyan);
+  background: rgba(19, 138, 126, 0.06);
+}
+
+.selector-chip.add-host-chip:hover {
+  border-color: rgba(19, 138, 126, 0.56);
+  background: rgba(19, 138, 126, 0.1);
+}
+
+.selector-chip.add-host-chip svg {
+  color: var(--cyan);
 }
 
 .selector-chip small {
@@ -2185,9 +2198,27 @@ h3 {
   text-align: right;
 }
 
+.ssh-server-dialog {
+  width: min(560px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.22);
+}
+
+.ssh-server-dialog .ssh-server-form {
+  border: 0;
+  background: #ffffff;
+}
+
+.ssh-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .ssh-server-form {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   padding: 12px;
   border: 1px solid rgba(19, 138, 126, 0.18);

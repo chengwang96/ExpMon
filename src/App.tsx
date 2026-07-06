@@ -16,6 +16,7 @@
   RefreshCw,
   Search,
   Server,
+  Plus,
   Settings,
   SlidersHorizontal,
   TerminalSquare,
@@ -156,6 +157,11 @@ type SshServerForm = {
   authType: "key" | "password";
   keyPath: string;
   password: string;
+};
+
+type SshSaveResult = {
+  server?: SshServer;
+  storagePath?: string;
 };
 
 type SshTestResult = {
@@ -973,10 +979,10 @@ function App() {
     });
   }, [language, performDeleteRunRecord, requestConfirm, t]);
 
-  const saveSshServer = useCallback((form: SshServerForm) => {
+  const saveSshServer = useCallback((form: SshServerForm): Promise<SshSaveResult> => {
     setSshSaveInFlight(true);
     setOperationMessage(language === "zh" ? "正在保存 SSH 服务器..." : "Saving SSH server...");
-    fetch(`${API_BASE}/api/ssh/servers`, {
+    return fetch(`${API_BASE}/api/ssh/servers`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(form)
@@ -986,14 +992,16 @@ function App() {
         if (!response.ok) {
           throw new Error(payload.error || `collector ${response.status}`);
         }
-        return payload as { server?: SshServer; storagePath?: string };
+        return payload as SshSaveResult;
       })
-      .then(() => {
+      .then((payload) => {
         setOperationMessage(language === "zh" ? "SSH 服务器已保存" : "SSH server saved");
         refreshSnapshot();
+        return payload;
       })
       .catch((error: Error) => {
         setOperationMessage(language === "zh" ? `保存 SSH 服务器失败：${error.message}` : `Saving SSH server failed: ${error.message}`);
+        throw error;
       })
       .finally(() => {
         setSshSaveInFlight(false);
@@ -1763,7 +1771,7 @@ function HostsView({
   sshServers: SshServer[];
   sshKeyCandidates: string[];
   onSelectHost: (hostId: string) => void;
-  onSaveSshServer: (form: SshServerForm) => void;
+  onSaveSshServer: (form: SshServerForm) => Promise<SshSaveResult>;
   onDeleteSshServer: (server: SshServer) => void;
   onRemoteHostRefresh: (host: Host) => void;
   sshSaveInFlight: boolean;
@@ -1771,6 +1779,7 @@ function HostsView({
 }) {
   const t = useT();
   const [historyRange, setHistoryRange] = useState<TimeRange>("15m");
+  const [showSshForm, setShowSshForm] = useState(false);
   const hostRuns = runs.filter((run) => run.hostId === selectedHost.id);
   const topProcesses = hostRuns
     .flatMap((run) => flattenProcessTree(run.processTree).map((proc) => ({ ...proc, run: run.name })))
@@ -1800,6 +1809,15 @@ function HostsView({
             <small>{host.cpuUsage}% CPU / {formatMemory(host, t)}</small>
           </button>
         ))}
+        <button
+          className="selector-chip add-host-chip"
+          onClick={() => setShowSshForm(true)}
+          title={t("addSshServer")}
+        >
+          <Plus size={18} />
+          <span>{t("addSshServer")}</span>
+          <small>SSH</small>
+        </button>
       </div>
 
       <div className="host-detail-grid">
@@ -1890,6 +1908,15 @@ function HostsView({
           )}
         </div>
       </div>
+      {showSshForm && (
+        <SshServerDialog
+          keyCandidates={sshKeyCandidates}
+          onSave={onSaveSshServer}
+          onRemoteHostRefresh={onRemoteHostRefresh}
+          onClose={() => setShowSshForm(false)}
+          saving={sshSaveInFlight}
+        />
+      )}
     </section>
   );
 }
@@ -3309,7 +3336,7 @@ function SshServerPanel({
   host: Host;
   servers: SshServer[];
   keyCandidates: string[];
-  onSave: (form: SshServerForm) => void;
+  onSave: (form: SshServerForm) => Promise<SshSaveResult>;
   onDelete: (server: SshServer) => void;
   onRemoteHostRefresh: (host: Host) => void;
   saving: boolean;
@@ -3320,32 +3347,13 @@ function SshServerPanel({
   const [testResults, setTestResults] = useState<Record<string, SshTestResult>>({});
   const [resourceLoadingId, setResourceLoadingId] = useState("");
   const [resourceResults, setResourceResults] = useState<Record<string, SshTestResult>>({});
-  const [form, setForm] = useState<SshServerForm>({
-    name: "",
-    host: "",
-    port: 22,
-    username: "",
-    authType: "key",
-    keyPath: keyCandidates[0] ?? "",
-    password: ""
-  });
-  useEffect(() => {
-    if (form.authType === "key" && !form.keyPath && keyCandidates[0]) {
-      setForm((current) => ({ ...current, keyPath: keyCandidates[0] }));
-    }
-  }, [form.authType, form.keyPath, keyCandidates]);
-  const updateForm = (patch: Partial<SshServerForm>) => setForm((current) => ({ ...current, ...patch }));
-  const submit = (event: React.FormEvent) => {
-    event.preventDefault();
-    onSave(form);
-  };
-  const testServer = (server: SshServer) => {
+  const runServerTest = useCallback((server: SshServer) => {
     setTestingId(server.id);
     setTestResults((current) => ({
       ...current,
       [server.id]: { ok: false, message: t("testingSsh") }
     }));
-    fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/test`, {
+    return fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/test`, {
       method: "POST"
     })
       .then(async (response) => {
@@ -3357,11 +3365,19 @@ function SshServerPanel({
       })
       .then((payload) => {
         setTestResults((current) => ({ ...current, [server.id]: payload }));
+        if (payload.ok) {
+          onRemoteHostRefresh(hostFromSshServer(server, payload));
+        }
+        return payload;
       })
       .catch((error: Error) => {
         setTestResults((current) => ({ ...current, [server.id]: { ok: false, error: error.message, message: error.message } }));
+        throw error;
       })
       .finally(() => setTestingId(""));
+  }, [onRemoteHostRefresh, t]);
+  const testServer = (server: SshServer) => {
+    runServerTest(server).catch(() => undefined);
   };
   const refreshRemoteResources = (server: SshServer) => {
     setResourceLoadingId(server.id);
@@ -3459,56 +3475,168 @@ function SshServerPanel({
           )}
         </div>
       ))}
-      <form className="ssh-server-form" onSubmit={submit}>
-        <div className="ssh-form-heading">
-          <strong>{t("addSshServer")}</strong>
-          <span>{t("sshPasswordNotice")}</span>
-        </div>
-        <label>
-          <span>Name</span>
-          <input value={form.name} onChange={(event) => updateForm({ name: event.target.value })} placeholder="server-01" />
-        </label>
-        <label>
-          <span>IP / Host</span>
-          <input value={form.host} onChange={(event) => updateForm({ host: event.target.value })} placeholder="192.168.1.20" required />
-        </label>
-        <label>
-          <span>Port</span>
-          <input type="number" min={1} max={65535} value={form.port} onChange={(event) => updateForm({ port: Number(event.target.value) })} required />
-        </label>
-        <label>
-          <span>User</span>
-          <input value={form.username} onChange={(event) => updateForm({ username: event.target.value })} placeholder="ubuntu" required />
-        </label>
-        <div className="ssh-auth-switch">
-          <button type="button" className={form.authType === "key" ? "active" : ""} onClick={() => updateForm({ authType: "key" })}>SSH key</button>
-          <button type="button" className={form.authType === "password" ? "active" : ""} onClick={() => updateForm({ authType: "password" })}>Password</button>
-        </div>
-        {form.authType === "key" ? (
-          <label className="ssh-form-wide">
-            <span>SSH key</span>
-            <input
-              list="ssh-key-candidates"
-              value={form.keyPath}
-              onChange={(event) => updateForm({ keyPath: event.target.value })}
-              placeholder="~/.ssh/id_ed25519"
-              required
-            />
-            <datalist id="ssh-key-candidates">
-              {keyCandidates.map((path) => <option key={path} value={path} />)}
-            </datalist>
+    </div>
+  );
+}
+
+function hostFromSshServer(server: SshServer, result?: SshTestResult): Host {
+  return {
+    id: `ssh:${server.id}`,
+    name: server.name || result?.hostname || server.host,
+    os: result?.hostname ? `SSH / ${result.hostname}` : "SSH",
+    address: server.host,
+    user: server.username,
+    cpuUsage: 0,
+    memoryUsedGb: 0,
+    memoryTotalGb: 0,
+    gpusTotal: 0,
+    gpusBusy: 0,
+    gpus: [],
+    diskRead: 0,
+    diskWrite: 0,
+    netRx: 0,
+    netTx: 0,
+    runningRuns: 0,
+    warnings: result?.ok ? [] : ["Remote resources not loaded"],
+    cores: [],
+    history: []
+  };
+}
+
+function SshServerDialog({
+  keyCandidates,
+  onSave,
+  onRemoteHostRefresh,
+  onClose,
+  saving
+}: {
+  keyCandidates: string[];
+  onSave: (form: SshServerForm) => Promise<SshSaveResult>;
+  onRemoteHostRefresh: (host: Host) => void;
+  onClose: () => void;
+  saving: boolean;
+}) {
+  const t = useT();
+  const [form, setForm] = useState<SshServerForm>({
+    name: "",
+    host: "",
+    port: 22,
+    username: "",
+    authType: "key",
+    keyPath: keyCandidates[0] ?? "",
+    password: ""
+  });
+  const [testResult, setTestResult] = useState<SshTestResult | null>(null);
+  const [testing, setTesting] = useState(false);
+  useEffect(() => {
+    if (form.authType === "key" && !form.keyPath && keyCandidates[0]) {
+      setForm((current) => ({ ...current, keyPath: keyCandidates[0] }));
+    }
+  }, [form.authType, form.keyPath, keyCandidates]);
+  const updateForm = (patch: Partial<SshServerForm>) => setForm((current) => ({ ...current, ...patch }));
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
+    setTestResult(null);
+    onSave(form)
+      .then(({ server }) => {
+        if (!server) {
+          return;
+        }
+        setTesting(true);
+        setTestResult({ ok: false, message: t("testingSsh") });
+        return fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/test`, {
+          method: "POST"
+        })
+          .then(async (response) => {
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(payload.error || `collector ${response.status}`);
+            }
+            return payload as SshTestResult;
+          })
+          .then((payload) => {
+            setTestResult(payload);
+            if (payload.ok) {
+              onRemoteHostRefresh(hostFromSshServer(server, payload));
+              onClose();
+            }
+          })
+          .catch((error: Error) => {
+            setTestResult({ ok: false, error: error.message, message: error.message });
+          })
+          .finally(() => setTesting(false));
+      })
+      .catch((error: Error) => {
+        setTestResult({ ok: false, error: error.message, message: error.message });
+      });
+  };
+
+  return (
+    <div className="confirm-overlay" role="presentation" onMouseDown={onClose}>
+      <section
+        className="ssh-server-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="ssh-server-dialog-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <form className="ssh-server-form" onSubmit={submit}>
+          <div className="ssh-form-heading">
+            <strong id="ssh-server-dialog-title">{t("addSshServer")}</strong>
+            <span>{t("sshPasswordNotice")}</span>
+          </div>
+          <label>
+            <span>Name</span>
+            <input value={form.name} onChange={(event) => updateForm({ name: event.target.value })} placeholder="server-01" />
           </label>
-        ) : (
-          <label className="ssh-form-wide">
-            <span>Password</span>
-            <input type="password" value={form.password} onChange={(event) => updateForm({ password: event.target.value })} required />
+          <label>
+            <span>IP / Host</span>
+            <input value={form.host} onChange={(event) => updateForm({ host: event.target.value })} placeholder="192.168.1.20" required />
           </label>
-        )}
-        <button className="action-button active-action ssh-form-wide" type="submit" disabled={saving}>
-          <Server size={16} />
-          {saving ? t("saving") : t("saveServer")}
-        </button>
-      </form>
+          <label>
+            <span>Port</span>
+            <input type="number" min={1} max={65535} value={form.port} onChange={(event) => updateForm({ port: Number(event.target.value) })} required />
+          </label>
+          <label>
+            <span>User</span>
+            <input value={form.username} onChange={(event) => updateForm({ username: event.target.value })} placeholder="ubuntu" required />
+          </label>
+          <div className="ssh-auth-switch">
+            <button type="button" className={form.authType === "key" ? "active" : ""} onClick={() => updateForm({ authType: "key" })}>SSH key</button>
+            <button type="button" className={form.authType === "password" ? "active" : ""} onClick={() => updateForm({ authType: "password" })}>Password</button>
+          </div>
+          {form.authType === "key" ? (
+            <label className="ssh-form-wide">
+              <span>SSH key</span>
+              <input
+                list="ssh-key-candidates"
+                value={form.keyPath}
+                onChange={(event) => updateForm({ keyPath: event.target.value })}
+                placeholder="~/.ssh/id_ed25519"
+                required
+              />
+              <datalist id="ssh-key-candidates">
+                {keyCandidates.map((path) => <option key={path} value={path} />)}
+              </datalist>
+            </label>
+          ) : (
+            <label className="ssh-form-wide">
+              <span>Password</span>
+              <input type="password" value={form.password} onChange={(event) => updateForm({ password: event.target.value })} required />
+            </label>
+          )}
+          {testResult && <div className="ssh-form-wide"><SshTestStatus result={testResult} /></div>}
+          <div className="ssh-form-actions ssh-form-wide">
+            <button className="action-button" type="button" onClick={onClose} disabled={saving || testing}>
+              {t("cancel")}
+            </button>
+            <button className="action-button active-action" type="submit" disabled={saving || testing}>
+              <Server size={16} />
+              {saving ? t("saving") : testing ? t("testingSsh") : t("saveServer")}
+            </button>
+          </div>
+        </form>
+      </section>
     </div>
   );
 }
