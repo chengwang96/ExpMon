@@ -1,0 +1,38 @@
+{
+  "name": "expmon-frontend",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Local-first general experiment task monitor",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chengwang96/ExpMon.git"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "collector": "python scripts/local_collector.py",
+    "expmon": "python scripts/expmon.py",
+    "start:local": "powershell -ExecutionPolicy Bypass -File scripts/start-expmon.ps1",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "npm run check:release",
+    "test:smoke": "python scripts/smoke.py",
+    "test:ui": "python scripts/regression.py",
+    "test:collector": "python scripts/collector_checks.py",
+    "test:privacy": "python scripts/privacy_scan.py",
+    "check:release": "npm run build && npm run test:collector && npm run test:privacy"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3"
+  }
+}

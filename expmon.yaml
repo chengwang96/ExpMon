@@ -1,0 +1,40 @@
+host_id: local
+
+sampling:
+  interval_seconds: 3
+  unmanaged_top_n: 80
+
+experiment_roots:
+  - ./
+
+run_discovery:
+  include_command_keywords:
+    - train
+    - retrain
+    - fit
+    - finetune
+    - fold
+    - torchrun
+    - deepspeed
+
+  exclude_command_keywords:
+    - codegraph
+    - local_collector.py
+    - local_collector
+    - Get-CimInstance Win32_Process
+    - collect_snapshot
+    - playwright
+    - vite
+    - node_modules
+
+  include_cwd_under:
+    - ./
+
+  explicit_rules: []
+
+protocol:
+  scan_roots:
+    - ./expmon-runs
+  manifest_cache_seconds: 3
+  max_scan_depth: 5
+  max_metric_points: 120
