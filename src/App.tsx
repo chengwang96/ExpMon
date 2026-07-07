@@ -1633,6 +1633,20 @@ type DraggableCardProps = {
   onClickCapture: (event: MouseEvent<HTMLElement>) => void;
 };
 
+type DragPreview = {
+  element: HTMLElement;
+  offsetX: number;
+  offsetY: number;
+  width: number;
+  height: number;
+  bounds: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
+};
+
 function readStoredOrder(storageKey: string) {
   try {
     const raw = window.localStorage.getItem(storageKey);
@@ -1645,6 +1659,10 @@ function readStoredOrder(storageKey: string) {
 
 function sameStringArray(left: string[], right: string[]) {
   return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), Math.max(min, max));
 }
 
 function usePersistentCardOrder<T>(
@@ -1660,13 +1678,78 @@ function usePersistentCardOrder<T>(
   const suppressNextClickRef = useRef(false);
   const dragSourceIdRef = useRef("");
   const lastReorderTargetRef = useRef("");
+  const dragPreviewRef = useRef<DragPreview | null>(null);
+
+  const removeDragPreview = useCallback(() => {
+    dragPreviewRef.current?.element.remove();
+    dragPreviewRef.current = null;
+    document.body.classList.remove("is-card-dragging");
+  }, []);
+
+  const updateDragPreview = useCallback((clientX: number, clientY: number) => {
+    const preview = dragPreviewRef.current;
+    if (!preview) {
+      return;
+    }
+    const left = clampNumber(
+      clientX - preview.offsetX,
+      preview.bounds.left,
+      preview.bounds.right - preview.width
+    );
+    const top = clampNumber(
+      clientY - preview.offsetY,
+      preview.bounds.top,
+      preview.bounds.bottom - preview.height
+    );
+    preview.element.style.left = `${left}px`;
+    preview.element.style.top = `${top}px`;
+  }, []);
+
+  const createDragPreview = useCallback((card: HTMLElement, clientX: number, clientY: number) => {
+    removeDragPreview();
+
+    const cardRect = card.getBoundingClientRect();
+    const panelRect = (card.closest<HTMLElement>(".panel") ?? card.parentElement ?? card).getBoundingClientRect();
+    const preview = card.cloneNode(true) as HTMLElement;
+    preview.classList.add("drag-card-preview");
+    preview.setAttribute("data-drag-preview", "true");
+    preview.removeAttribute("data-dragging");
+    preview.removeAttribute("data-drag-over");
+    preview.style.position = "fixed";
+    preview.style.left = `${cardRect.left}px`;
+    preview.style.top = `${cardRect.top}px`;
+    preview.style.width = `${cardRect.width}px`;
+    preview.style.height = `${cardRect.height}px`;
+    preview.style.margin = "0";
+    preview.style.boxSizing = "border-box";
+    preview.style.pointerEvents = "none";
+    preview.style.zIndex = "10000";
+    document.body.appendChild(preview);
+    document.body.classList.add("is-card-dragging");
+
+    dragPreviewRef.current = {
+      element: preview,
+      offsetX: clientX - cardRect.left,
+      offsetY: clientY - cardRect.top,
+      width: cardRect.width,
+      height: cardRect.height,
+      bounds: {
+        left: panelRect.left,
+        top: panelRect.top,
+        right: panelRect.right,
+        bottom: panelRect.bottom,
+      },
+    };
+    updateDragPreview(clientX, clientY);
+  }, [removeDragPreview, updateDragPreview]);
 
   const clearDragState = useCallback(() => {
     setDragOverId("");
     setDraggingId("");
     dragSourceIdRef.current = "";
     lastReorderTargetRef.current = "";
-  }, []);
+    removeDragPreview();
+  }, [removeDragPreview]);
 
   useEffect(() => {
     window.addEventListener("pointerup", clearDragState);
@@ -1753,11 +1836,12 @@ function usePersistentCardOrder<T>(
     return Boolean(interactive && interactive !== card);
   }, []);
 
-  const startCardDrag = useCallback((id: string) => {
+  const startCardDrag = useCallback((id: string, card: HTMLElement, clientX: number, clientY: number) => {
     dragSourceIdRef.current = id;
     lastReorderTargetRef.current = "";
     setDraggingId(id);
-  }, []);
+    createDragPreview(card, clientX, clientY);
+  }, [createDragPreview]);
 
   const handleGlobalPointerDown = useCallback((event: globalThis.PointerEvent) => {
     if (event.button !== 0) {
@@ -1768,7 +1852,7 @@ function usePersistentCardOrder<T>(
     if (!card || !id || shouldIgnoreGlobalDragStart(event, card)) {
       return;
     }
-    startCardDrag(id);
+    startCardDrag(id, card, event.clientX, event.clientY);
   }, [findCardElementAtPoint, shouldIgnoreGlobalDragStart, startCardDrag]);
 
   const handleGlobalMouseDown = useCallback((event: globalThis.MouseEvent) => {
@@ -1780,7 +1864,7 @@ function usePersistentCardOrder<T>(
     if (!card || !id || shouldIgnoreGlobalDragStart(event, card)) {
       return;
     }
-    startCardDrag(id);
+    startCardDrag(id, card, event.clientX, event.clientY);
   }, [findCardElementAtPoint, shouldIgnoreGlobalDragStart, startCardDrag]);
 
   useEffect(() => {
@@ -1797,14 +1881,20 @@ function usePersistentCardOrder<T>(
     if (!sourceId) {
       return;
     }
+    updateDragPreview(event.clientX, event.clientY);
     const targetId = findCardIdAtPoint(event.clientX, event.clientY);
-    if (!targetId || targetId === sourceId || lastReorderTargetRef.current === targetId) {
+    if (!targetId || targetId === sourceId) {
+      lastReorderTargetRef.current = "";
+      setDragOverId("");
+      return;
+    }
+    if (lastReorderTargetRef.current === targetId) {
       return;
     }
     lastReorderTargetRef.current = targetId;
     setDragOverId(targetId);
     moveCard(sourceId, targetId);
-  }, [findCardIdAtPoint, moveCard]);
+  }, [findCardIdAtPoint, moveCard, updateDragPreview]);
 
   useEffect(() => {
     window.addEventListener("pointermove", handlePointerMove);
@@ -1816,19 +1906,27 @@ function usePersistentCardOrder<T>(
     if (!sourceId) {
       return;
     }
+    updateDragPreview(event.clientX, event.clientY);
     const targetId = findCardIdAtPoint(event.clientX, event.clientY);
-    if (!targetId || targetId === sourceId || lastReorderTargetRef.current === targetId) {
+    if (!targetId || targetId === sourceId) {
+      lastReorderTargetRef.current = "";
+      setDragOverId("");
+      return;
+    }
+    if (lastReorderTargetRef.current === targetId) {
       return;
     }
     lastReorderTargetRef.current = targetId;
     setDragOverId(targetId);
     moveCard(sourceId, targetId);
-  }, [findCardIdAtPoint, moveCard]);
+  }, [findCardIdAtPoint, moveCard, updateDragPreview]);
 
   useEffect(() => {
     window.addEventListener("mousemove", handleMouseMove);
     return () => window.removeEventListener("mousemove", handleMouseMove);
   }, [handleMouseMove]);
+
+  useEffect(() => removeDragPreview, [removeDragPreview]);
 
   const dragPropsFor = useCallback((id: string): DraggableCardProps => ({
     draggable: false,

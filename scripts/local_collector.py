@@ -2230,11 +2230,37 @@ def project_path_for_cwd(cwd: str) -> Path | None:
     return cwd_path
 
 
+def project_path_for_run(run: dict[str, Any]) -> Path | None:
+    cwd = str(run.get("cwd") or "")
+    if not cwd:
+        return None
+    project_name = str(run.get("project") or "").strip()
+    try:
+        cwd_path = Path(cwd).resolve()
+    except OSError:
+        return None
+
+    if project_name and project_name not in {".", ".."} and not Path(project_name).is_absolute():
+        for root in configured_roots():
+            try:
+                root_path = root.resolve()
+                if not path_is_under(cwd_path, root_path):
+                    continue
+                if root_path.name == project_name:
+                    return root_path
+                candidate = (root_path / project_name).resolve()
+                if candidate.exists() and path_is_under(cwd_path, candidate):
+                    return candidate
+            except (OSError, ValueError):
+                continue
+
+    return project_path_for_cwd(cwd)
+
+
 def projects_from_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     projects: dict[str, dict[str, Any]] = {}
     for run in runs:
-        cwd = str(run.get("cwd") or "")
-        project_path = project_path_for_cwd(cwd)
+        project_path = project_path_for_run(run)
         if not project_path:
             continue
         root = git_root_for_path(project_path)

@@ -1,5 +1,7 @@
 # ExpMon
 
+[中文文档](README_zh.md)
+
 ExpMon is a local-first experiment task monitor. It tracks managed and discovered experiment processes, host resources, GPU usage, metrics, logs, and common experiment log formats from a browser UI.
 
 ## Quick Start

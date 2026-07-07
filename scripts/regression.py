@@ -11,7 +11,7 @@ def note(message: str) -> None:
 
 def click_nav(page, index: int) -> None:
     page.locator("nav.nav-list button").nth(index).click()
-    page.wait_for_load_state("networkidle")
+    page.wait_for_load_state("domcontentloaded")
 
 
 def first_enabled(locator):
@@ -38,7 +38,7 @@ def main() -> None:
             });
             """
         )
-        page.goto(frontend_url, wait_until="networkidle")
+        page.goto(frontend_url, wait_until="domcontentloaded")
 
         expect(page.get_by_role("heading", name="Resource Dashboard")).to_be_visible()
         expect(page.locator("nav.nav-list").get_by_role("button", name="Run Detail")).to_have_count(0)
@@ -55,10 +55,56 @@ def main() -> None:
                 raise AssertionError("dashboard host cards were not measurable for drag test")
             page.mouse.move(first_box["x"] + first_box["width"] / 2, first_box["y"] + first_box["height"] / 2)
             page.mouse.down()
+            preview = page.locator("[data-drag-preview='true']")
+            expect(preview).to_be_visible()
+            panel_box = page.locator(".dashboard-host-panel").bounding_box()
+            if panel_box is None:
+                raise AssertionError("dashboard host panel was not measurable for drag preview test")
+            page.mouse.move(panel_box["x"] + panel_box["width"] + 200, panel_box["y"] + panel_box["height"] + 200, steps=6)
+            preview_box = preview.bounding_box()
+            if preview_box is None:
+                raise AssertionError("drag preview was not measurable")
+            if preview_box["x"] < panel_box["x"] - 1 or preview_box["y"] < panel_box["y"] - 1:
+                raise AssertionError("drag preview escaped above or left of the host panel")
+            if preview_box["x"] + preview_box["width"] > panel_box["x"] + panel_box["width"] + 1:
+                raise AssertionError("drag preview escaped right of the host panel")
+            if preview_box["y"] + preview_box["height"] > panel_box["y"] + panel_box["height"] + 1:
+                raise AssertionError("drag preview escaped below the host panel")
+            page.mouse.up()
+            expect(preview).to_have_count(0)
+
+            host_cards.nth(0).scroll_into_view_if_needed()
+            first_host_id = host_cards.nth(0).get_attribute("data-draggable-card-id")
+            first_box = host_cards.nth(0).bounding_box()
+            second_box = host_cards.nth(1).bounding_box()
+            if first_box is None or second_box is None or first_host_id is None:
+                raise AssertionError("dashboard host cards were not measurable for reorder test")
+            page.mouse.move(first_box["x"] + first_box["width"] / 2, first_box["y"] + first_box["height"] / 2)
+            page.mouse.down()
             page.mouse.move(second_box["x"] + second_box["width"] / 2, second_box["y"] + second_box["height"] / 2, steps=12)
             page.mouse.up()
             expect(host_cards.nth(1)).to_have_attribute("data-draggable-card-id", first_host_id)
-            page.reload(wait_until="networkidle")
+
+            returned_first_box = host_cards.nth(0).bounding_box()
+            moved_first_box = host_cards.nth(1).bounding_box()
+            if returned_first_box is None or moved_first_box is None:
+                raise AssertionError("dashboard host cards were not measurable for drag rollback test")
+            page.mouse.move(moved_first_box["x"] + moved_first_box["width"] / 2, moved_first_box["y"] + moved_first_box["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(returned_first_box["x"] + returned_first_box["width"] / 2, returned_first_box["y"] + returned_first_box["height"] / 2, steps=12)
+            page.mouse.up()
+            expect(host_cards.nth(0)).to_have_attribute("data-draggable-card-id", first_host_id)
+
+            first_box = host_cards.nth(0).bounding_box()
+            second_box = host_cards.nth(1).bounding_box()
+            if first_box is None or second_box is None:
+                raise AssertionError("dashboard host cards were not measurable for final reorder test")
+            page.mouse.move(first_box["x"] + first_box["width"] / 2, first_box["y"] + first_box["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(second_box["x"] + second_box["width"] / 2, second_box["y"] + second_box["height"] / 2, steps=12)
+            page.mouse.up()
+            expect(host_cards.nth(1)).to_have_attribute("data-draggable-card-id", first_host_id)
+            page.reload(wait_until="domcontentloaded")
             page.wait_for_timeout(500)
             page.locator(".dashboard-host-grid [data-draggable-card='true']").nth(0).scroll_into_view_if_needed()
             expect(page.locator(".dashboard-host-grid [data-draggable-card='true']").nth(1)).to_have_attribute("data-draggable-card-id", first_host_id)
@@ -86,7 +132,7 @@ def main() -> None:
             note("SKIP: run detail checks, no runs in current snapshot")
         else:
             run_rows.first.click()
-            page.wait_for_load_state("networkidle")
+            page.wait_for_load_state("domcontentloaded")
             expect(page.get_by_role("heading", name="Run Detail")).to_be_visible()
             expect(page.get_by_role("button", name="Back to Runs")).to_be_visible()
             note("PASS: run row opens detail")
