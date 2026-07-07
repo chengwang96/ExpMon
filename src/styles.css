@@ -938,9 +938,20 @@ h3 {
 }
 
 .dashboard-host-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.dashboard-host-grid .host-tile {
+  flex: 0 1 auto;
+  width: fit-content;
+  min-width: 260px;
+  max-width: 100%;
+}
+
+.dashboard-host-grid .host-readouts {
+  grid-template-columns: repeat(2, minmax(82px, max-content));
 }
 
 .host-mix-list {
