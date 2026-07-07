@@ -125,10 +125,17 @@ pip install tensorboard mlflow
 如果希望稳定监控 Windows、macOS 或 Ubuntu 远端机器，建议在目标机器上运行轻量 remote agent：
 
 ```powershell
-python scripts/remote_agent.py --host 0.0.0.0 --port 5194
+python scripts/remote_agent.py --host 127.0.0.1 --port 5194
 ```
 
-本地 collector 会优先请求 `http://<ssh-host>:5194/api/host`；agent 不可达时，再回退到一次性 SSH 采样。如果使用其他端口，可以在本地 collector 设置 `EXPMON_REMOTE_AGENT_PORT`。如果处在共享网络中，可以在远端 agent 设置 `EXPMON_AGENT_TOKEN`，并在本地 collector 设置相同的 `EXPMON_REMOTE_AGENT_TOKEN`。
+当远端机器也安装了 ExpMon，本地 collector 会先做 discovery handshake，再回退到一次性 SSH 采样：
+
+1. 先尝试直连显式暴露的 remote agent：`http://<ssh-host>:5194/api/host`。
+2. 通过 SSH 执行 `expmon discover --json`。
+3. 读取标准 discovery manifest：Windows 为 `%LOCALAPPDATA%\ExpMon\discovery.json`，Linux/macOS 为 `~/.config/expmon/discovery.json`。
+4. 如果发现远端 agent 正在远端 `127.0.0.1` 运行，本地 collector 会自动创建 SSH tunnel，从本地随机端口转发到远端 agent，再通过 tunnel 采样。
+
+因此推荐让 agent 绑定 `127.0.0.1`，远端机器不需要开放 HTTP 端口。如果确实要暴露其他直连端口，可以在本地 collector 设置 `EXPMON_REMOTE_AGENT_PORT`。共享环境中，可以在远端 agent 设置 `EXPMON_AGENT_TOKEN`，并在本地 collector 设置相同的 `EXPMON_REMOTE_AGENT_TOKEN`。设置 `EXPMON_REMOTE_AGENT_AUTOSTART=1` 后，如果 discovery 发现远端安装了 ExpMon 但 agent 未运行，本地 collector 会尝试执行 `expmon agent start --background`。
 
 密码配置会按要求保存在本地，但非交互式连接测试和一次性 SSH 快照需要 `sshpass`，或者把配置切换为基于密钥的认证。
 

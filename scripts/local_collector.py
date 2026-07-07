@@ -42,6 +42,8 @@ RUN_IO_HISTORY: dict[str, tuple[float, float, float]] = {}
 HOST_IO_HISTORY: tuple[float, float, float, float, float] | None = None
 HOST_RESOURCE_HISTORY: dict[str, list[dict[str, Any]]] = {}
 REMOTE_AGENT_UNAVAILABLE_UNTIL: dict[str, float] = {}
+REMOTE_EXPMON_DISCOVERY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+REMOTE_AGENT_TUNNELS: dict[str, dict[str, Any]] = {}
 DELETABLE_RUN_STATUSES = {"finished", "failed", "killed"}
 
 NVIDIA_POWER_LIMIT_CATALOG_W = {
@@ -583,6 +585,28 @@ def ssh_stdin_command_for_server(server: dict[str, Any], remote_command: str) ->
     if not command:
         return None, {"ok": False, "error": "failed to build ssh command", "server": public_ssh_server(server)}
     command.extend([target, remote_command])
+    return command, None
+
+
+def ssh_tunnel_command_for_server(
+    server: dict[str, Any],
+    local_port: int,
+    remote_host: str,
+    remote_port: int,
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    command, target, error_payload = ssh_base_command_for_server(server)
+    if error_payload:
+        return None, error_payload
+    if not command:
+        return None, {"ok": False, "error": "failed to build ssh command", "server": public_ssh_server(server)}
+    command.extend([
+        "-N",
+        "-L",
+        f"127.0.0.1:{local_port}:{remote_host}:{remote_port}",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        target,
+    ])
     return command, None
 
 
@@ -1201,8 +1225,46 @@ def remote_host_payload(
         "pythonPath": python_path,
         "host": host,
         "source": source,
-        "message": "remote agent snapshot ok" if source == "agent" else "remote resource snapshot ok",
+        "message": "remote agent snapshot ok" if source.startswith("agent") else "remote resource snapshot ok",
     }
+
+
+def free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def parse_json_payload(text: str) -> dict[str, Any]:
+    for line in reversed([line.strip() for line in text.splitlines() if line.strip()]):
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def remote_agent_json(url: str) -> dict[str, Any] | None:
+    headers = {"Accept": "application/json"}
+    token = os.environ.get("EXPMON_REMOTE_AGENT_TOKEN", "").strip()
+    if token:
+        headers["X-ExpMon-Agent-Token"] = token
+    try:
+        with urlopen(Request(url, headers=headers), timeout=2.5) as response:
+            raw = response.read(1024 * 1024).decode("utf-8", errors="replace")
+    except (OSError, HTTPError, URLError):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
 
 
 def remote_agent_snapshot(server_id: str, server: dict[str, Any]) -> dict[str, Any] | None:
@@ -1215,23 +1277,9 @@ def remote_agent_snapshot(server_id: str, server: dict[str, Any]) -> dict[str, A
         return None
     port = int(os.environ.get("EXPMON_REMOTE_AGENT_PORT", "5194"))
     url = f"http://{host}:{port}/api/host"
-    headers = {"Accept": "application/json"}
-    token = os.environ.get("EXPMON_REMOTE_AGENT_TOKEN", "").strip()
-    if token:
-        headers["X-ExpMon-Agent-Token"] = token
     started = time.time()
-    try:
-        with urlopen(Request(url, headers=headers), timeout=2.5) as response:
-            raw = response.read(1024 * 1024).decode("utf-8", errors="replace")
-    except (OSError, HTTPError, URLError):
-        REMOTE_AGENT_UNAVAILABLE_UNTIL[server_id] = now + 60
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        REMOTE_AGENT_UNAVAILABLE_UNTIL[server_id] = now + 60
-        return None
-    if not isinstance(parsed, dict) or not parsed:
+    parsed = remote_agent_json(url)
+    if parsed is None:
         REMOTE_AGENT_UNAVAILABLE_UNTIL[server_id] = now + 60
         return None
     REMOTE_AGENT_UNAVAILABLE_UNTIL.pop(server_id, None)
@@ -1247,6 +1295,113 @@ def remote_agent_snapshot(server_id: str, server: dict[str, Any]) -> dict[str, A
     )
 
 
+def remote_expmon_discovery(server_id: str, server: dict[str, Any], remote_os: str | None = None) -> dict[str, Any] | None:
+    now = time.time()
+    cached = REMOTE_EXPMON_DISCOVERY_CACHE.get(server_id)
+    if cached and now - cached[0] < 60:
+        return cached[1]
+
+    commands = ["expmon discover --json"]
+    for command in commands:
+        completed, _, _ = run_ssh_remote_command(server, command, timeout=8)
+        if completed and completed.returncode == 0:
+            parsed = parse_json_payload(completed.stdout)
+            if parsed.get("ok") and str(parsed.get("name") or "").lower() == "expmon":
+                REMOTE_EXPMON_DISCOVERY_CACHE[server_id] = (now, parsed)
+                return parsed
+
+    detected_os = remote_os or detect_remote_os(server)
+    if detected_os == "windows":
+        manifest_command = (
+            "powershell -NoProfile -Command "
+            "\"$p=Join-Path $env:LOCALAPPDATA 'ExpMon\\discovery.json'; "
+            "if (Test-Path $p) { Get-Content -Raw -Encoding UTF8 $p }\""
+        )
+    else:
+        manifest_command = "sh -lc 'p=\"${XDG_CONFIG_HOME:-$HOME/.config}/expmon/discovery.json\"; if [ -f \"$p\" ]; then cat \"$p\"; fi'"
+    completed, _, _ = run_ssh_remote_command(server, manifest_command, timeout=8)
+    if completed and completed.returncode == 0:
+        parsed = parse_json_payload(completed.stdout)
+        if parsed.get("ok") and str(parsed.get("name") or "").lower() == "expmon":
+            REMOTE_EXPMON_DISCOVERY_CACHE[server_id] = (now, parsed)
+            return parsed
+    REMOTE_EXPMON_DISCOVERY_CACHE[server_id] = (now, {})
+    return None
+
+
+def tunnel_target_host(bind: str) -> str:
+    value = str(bind or "").strip().lower()
+    if value in {"", "0.0.0.0", "::", "[::]", "localhost"}:
+        return "127.0.0.1"
+    return str(bind).strip()
+
+
+def ensure_remote_agent_tunnel(server_id: str, server: dict[str, Any], agent: dict[str, Any]) -> str | None:
+    port = int(agent.get("port") or 5194)
+    remote_host = tunnel_target_host(str(agent.get("bind") or "127.0.0.1"))
+    existing = REMOTE_AGENT_TUNNELS.get(server_id)
+    if existing:
+        process = existing.get("process")
+        if isinstance(process, subprocess.Popen) and process.poll() is None:
+            return f"http://127.0.0.1:{existing.get('localPort')}/api/host"
+    local_port = free_local_port()
+    command, error_payload = ssh_tunnel_command_for_server(server, local_port, remote_host, port)
+    if error_payload or not command:
+        return None
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **kwargs)
+    except OSError:
+        return None
+    REMOTE_AGENT_TUNNELS[server_id] = {"process": process, "localPort": local_port, "remoteHost": remote_host, "remotePort": port}
+    time.sleep(0.6)
+    if process.poll() is not None:
+        REMOTE_AGENT_TUNNELS.pop(server_id, None)
+        return None
+    return f"http://127.0.0.1:{local_port}/api/host"
+
+
+def remote_expmon_agent_snapshot(server_id: str, server: dict[str, Any], remote_os: str | None = None) -> dict[str, Any] | None:
+    discovery = remote_expmon_discovery(server_id, server, remote_os=remote_os)
+    if not discovery:
+        return None
+    agent = discovery.get("agent") if isinstance(discovery.get("agent"), dict) else {}
+    if not agent.get("running"):
+        if os.environ.get("EXPMON_REMOTE_AGENT_AUTOSTART", "").strip() == "1" and agent.get("installed"):
+            run_ssh_remote_command(server, "expmon agent start --background --bind 127.0.0.1 --port 5194", timeout=8)
+            REMOTE_EXPMON_DISCOVERY_CACHE.pop(server_id, None)
+            discovery = remote_expmon_discovery(server_id, server, remote_os=remote_os)
+            agent = discovery.get("agent") if isinstance(discovery and discovery.get("agent"), dict) else {}
+        if not agent.get("running"):
+            return None
+    started = time.time()
+    url = ensure_remote_agent_tunnel(server_id, server, agent)
+    if not url:
+        return None
+    parsed = remote_agent_json(url)
+    if parsed is None:
+        REMOTE_AGENT_TUNNELS.pop(server_id, None)
+        return None
+    return remote_host_payload(
+        server_id,
+        server,
+        parsed,
+        sampled_at=str(parsed.get("sampledAt") or datetime.now().isoformat(timespec="seconds")),
+        latency_ms=int((time.time() - started) * 1000),
+        remote_os=str(discovery.get("platform") or parsed.get("remoteOs") or parsed.get("os") or remote_os or "agent"),
+        python_path=str(parsed.get("pythonPath") or ""),
+        source="agent-tunnel",
+    )
+
+
 def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
     server = ssh_server_by_id(server_id)
     if not server:
@@ -1255,6 +1410,10 @@ def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
     agent_payload = remote_agent_snapshot(server_id, server)
     if agent_payload:
         return 200, agent_payload
+
+    expmon_agent_payload = remote_expmon_agent_snapshot(server_id, server)
+    if expmon_agent_payload:
+        return 200, expmon_agent_payload
 
     remote_os = detect_remote_os(server)
     if remote_os == "windows":

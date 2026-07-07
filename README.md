@@ -125,10 +125,17 @@ The **Host / SSH** page shows local host resources and stores remote SSH server 
 For stable remote monitoring on Windows, macOS, or Ubuntu, run the lightweight remote agent on the target machine:
 
 ```powershell
-python scripts/remote_agent.py --host 0.0.0.0 --port 5194
+python scripts/remote_agent.py --host 127.0.0.1 --port 5194
 ```
 
-The local collector first tries `http://<ssh-host>:5194/api/host` and falls back to one-shot SSH sampling when the agent is not reachable. Use `EXPMON_REMOTE_AGENT_PORT` on the local collector if you choose a different port. For a shared network, set `EXPMON_AGENT_TOKEN` on the remote agent and the same value as `EXPMON_REMOTE_AGENT_TOKEN` on the local collector.
+When ExpMon is installed on the remote machine, the local collector uses a discovery handshake before falling back to one-shot SSH sampling:
+
+1. Try a direct remote agent at `http://<ssh-host>:5194/api/host` for explicitly exposed agents.
+2. Run `expmon discover --json` over SSH.
+3. Read the standard discovery manifest (`%LOCALAPPDATA%\ExpMon\discovery.json` on Windows or `~/.config/expmon/discovery.json` on Linux/macOS).
+4. If the remote agent is running on remote `127.0.0.1`, open an SSH tunnel from a local random port to the remote agent and sample through that tunnel.
+
+This means the recommended agent bind address is `127.0.0.1`; the remote host does not need to expose an HTTP port. Use `EXPMON_REMOTE_AGENT_PORT` on the local collector if you intentionally expose a different direct-agent port. For shared environments, set `EXPMON_AGENT_TOKEN` on the remote agent and the same value as `EXPMON_REMOTE_AGENT_TOKEN` on the local collector. Setting `EXPMON_REMOTE_AGENT_AUTOSTART=1` lets the local collector try `expmon agent start --background` when discovery finds ExpMon installed but the agent is not running.
 
 Password SSH profiles are saved locally as requested, but non-interactive connection testing and one-shot SSH snapshots require `sshpass` or switching the profile to key-based authentication.
 

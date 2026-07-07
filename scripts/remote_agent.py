@@ -11,6 +11,7 @@ import subprocess
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import psutil
@@ -22,6 +23,8 @@ MAX_HISTORY = int(os.environ.get("EXPMON_AGENT_MAX_HISTORY", "240"))
 TOKEN = os.environ.get("EXPMON_AGENT_TOKEN", "").strip()
 GPU_CACHE: tuple[float, list[dict[str, Any]]] | None = None
 GPU_CACHE_SECONDS = float(os.environ.get("EXPMON_AGENT_GPU_CACHE_SECONDS", "10"))
+APP_ROOT = Path(__file__).resolve().parents[1]
+DISCOVERY_CAPABILITIES = ["host", "gpu", "gpu_process", "process", "memory_breakdown", "disk_network"]
 
 NVIDIA_POWER_LIMIT_CATALOG_W = {
     "rtx 5090": 575,
@@ -180,6 +183,56 @@ def catalog_power_limit_w(name: str) -> float | None:
         if key in normalized:
             return float(watts)
     return None
+
+
+def package_version() -> str:
+    try:
+        package = json.loads((APP_ROOT / "package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "0.0.0"
+    return str(package.get("version") or "0.0.0")
+
+
+def discovery_path() -> Path:
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA")
+        base = Path(root) if root else Path.home() / "AppData" / "Local"
+        return base / "ExpMon" / "discovery.json"
+    root = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(root) if root else Path.home() / ".config"
+    return base / "expmon" / "discovery.json"
+
+
+def discovery_payload(bind: str, port: int) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "name": "ExpMon",
+        "version": package_version(),
+        "platform": platform.system().lower(),
+        "os": platform.platform(),
+        "hostname": socket.gethostname(),
+        "user": getpass.getuser(),
+        "installRoot": str(APP_ROOT),
+        "discoveryPath": str(discovery_path()),
+        "agent": {
+            "installed": True,
+            "running": True,
+            "bind": bind,
+            "port": int(port),
+            "pid": os.getpid(),
+            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+        },
+        "capabilities": DISCOVERY_CAPABILITIES,
+    }
+
+
+def write_discovery_manifest(bind: str, port: int) -> None:
+    path = discovery_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(discovery_payload(bind, port), ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return
 
 
 def io_rates(read_total: float, write_total: float, rx_total: float, tx_total: float) -> tuple[float, float, float, float]:
@@ -408,7 +461,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "unauthorized"}, status=401)
                 return
         if self.path == "/api/health":
-            self.send_json({"ok": True, "hostname": socket.gethostname()})
+            host, port = self.server.server_address[:2]
+            self.send_json({**discovery_payload(str(host), int(port)), "hostname": socket.gethostname()})
             return
         if self.path == "/api/host":
             self.send_json(sample_host())
@@ -432,8 +486,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ExpMon lightweight remote resource collector")
     parser.add_argument("--host", default=os.environ.get("EXPMON_AGENT_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("EXPMON_AGENT_PORT", "5194")))
+    parser.add_argument("--probe", action="store_true", help="print discovery JSON without starting the server")
     args = parser.parse_args()
+    if args.probe:
+        print(json.dumps(discovery_payload(args.host, args.port), ensure_ascii=False))
+        return
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    write_discovery_manifest(args.host, args.port)
     print(f"ExpMon remote agent listening on http://{args.host}:{args.port}")
     server.serve_forever()
 

@@ -1,6 +1,8 @@
 import argparse
+import getpass
 import json
 import os
+import platform
 import queue
 import re
 import secrets
@@ -29,6 +31,15 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOGDIR = APP_ROOT / "expmon-runs"
 METRIC_PREFIX = "EXPMON_METRIC"
 EVENT_PREFIX = "EXPMON_EVENT"
+DEFAULT_AGENT_PORT = 5194
+DISCOVERY_CAPABILITIES = [
+    "host",
+    "gpu",
+    "gpu_process",
+    "process",
+    "memory_breakdown",
+    "disk_network",
+]
 
 
 def now_iso() -> str:
@@ -49,6 +60,115 @@ def write_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def package_version() -> str:
+    try:
+        package = json.loads((APP_ROOT / "package.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "0.0.0"
+    return str(package.get("version") or "0.0.0")
+
+
+def discovery_path() -> Path:
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA")
+        base = Path(root) if root else Path.home() / "AppData" / "Local"
+        return base / "ExpMon" / "discovery.json"
+    root = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(root) if root else Path.home() / ".config"
+    return base / "expmon" / "discovery.json"
+
+
+def pid_alive(pid: Any) -> bool:
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    if psutil is not None:
+        return psutil.pid_exists(value)
+    try:
+        os.kill(value, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_discovery_manifest() -> dict[str, Any]:
+    path = discovery_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def discover(args: argparse.Namespace) -> int:
+    manifest = read_discovery_manifest()
+    agent = manifest.get("agent") if isinstance(manifest.get("agent"), dict) else {}
+    agent_running = bool(agent.get("running")) and pid_alive(agent.get("pid"))
+    payload = {
+        "ok": True,
+        "name": "ExpMon",
+        "version": package_version(),
+        "platform": platform.system().lower(),
+        "os": platform.platform(),
+        "hostname": socket.gethostname(),
+        "user": getpass.getuser(),
+        "installRoot": str(APP_ROOT),
+        "discoveryPath": str(discovery_path()),
+        "agent": {
+            "installed": (APP_ROOT / "scripts" / "remote_agent.py").exists(),
+            "running": agent_running,
+            "bind": str(agent.get("bind") or "127.0.0.1"),
+            "port": int(agent.get("port") or DEFAULT_AGENT_PORT),
+            "pid": int(agent.get("pid") or 0) if str(agent.get("pid") or "").isdigit() else 0,
+            "updatedAt": str(agent.get("updatedAt") or ""),
+        },
+        "capabilities": DISCOVERY_CAPABILITIES,
+    }
+    print(json.dumps(payload, ensure_ascii=False if getattr(args, "json", False) else True, indent=None if getattr(args, "json", False) else 2))
+    return 0
+
+
+def agent_start(args: argparse.Namespace) -> int:
+    agent_path = APP_ROOT / "scripts" / "remote_agent.py"
+    if not agent_path.exists():
+        print(json.dumps({"ok": False, "error": "remote_agent.py not found", "installRoot": str(APP_ROOT)}))
+        return 2
+    command = [
+        sys.executable,
+        str(agent_path),
+        "--host",
+        args.bind,
+        "--port",
+        str(args.port),
+    ]
+    if args.background:
+        kwargs: dict[str, Any] = {
+            "cwd": str(APP_ROOT),
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "start_new_session": os.name != "nt",
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        process = subprocess.Popen(command, **kwargs)
+        time.sleep(0.4)
+        print(json.dumps({
+            "ok": True,
+            "agent": {
+                "running": True,
+                "pid": process.pid,
+                "bind": args.bind,
+                "port": args.port,
+            },
+        }))
+        return 0
+    return subprocess.call(command, cwd=str(APP_ROOT))
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -382,6 +502,18 @@ def build_parser() -> argparse.ArgumentParser:
     event_parser.add_argument("--message", default="")
     event_parser.add_argument("field", nargs="*")
     event_parser.set_defaults(func=log_event)
+
+    discover_parser = subparsers.add_parser("discover", help="print ExpMon installation and agent discovery JSON")
+    discover_parser.add_argument("--json", action="store_true", help="emit compact JSON for machine parsing")
+    discover_parser.set_defaults(func=discover)
+
+    agent_parser = subparsers.add_parser("agent", help="manage the lightweight remote agent")
+    agent_subparsers = agent_parser.add_subparsers(dest="agent_command", required=True)
+    agent_start_parser = agent_subparsers.add_parser("start", help="start the lightweight remote agent")
+    agent_start_parser.add_argument("--bind", default="127.0.0.1")
+    agent_start_parser.add_argument("--port", type=int, default=DEFAULT_AGENT_PORT)
+    agent_start_parser.add_argument("--background", action="store_true")
+    agent_start_parser.set_defaults(func=agent_start)
     return parser
 
 
