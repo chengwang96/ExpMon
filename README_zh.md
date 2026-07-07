@@ -120,7 +120,17 @@ pip install tensorboard mlflow
 
 ## Host / SSH
 
-**Host / SSH** 页面会显示本地主机资源，并把远程 SSH 服务器配置存储在一个被 Git 忽略的本地文件中。基于密钥的 SSH 配置可以在 UI 中通过本地 `ssh` 命令测试，并可按需获取远程资源快照。密码配置会按要求保存在本地，但非交互式连接测试和远程资源快照需要 `sshpass`，或者把配置切换为基于密钥的认证。
+**Host / SSH** 页面会显示本地主机资源，并把远程 SSH 服务器配置存储在一个被 Git 忽略的本地文件中。基于密钥的 SSH 配置可以在 UI 中通过本地 `ssh` 命令测试。
+
+如果希望稳定监控 Windows、macOS 或 Ubuntu 远端机器，建议在目标机器上运行轻量 remote agent：
+
+```powershell
+python scripts/remote_agent.py --host 0.0.0.0 --port 5194
+```
+
+本地 collector 会优先请求 `http://<ssh-host>:5194/api/host`；agent 不可达时，再回退到一次性 SSH 采样。如果使用其他端口，可以在本地 collector 设置 `EXPMON_REMOTE_AGENT_PORT`。如果处在共享网络中，可以在远端 agent 设置 `EXPMON_AGENT_TOKEN`，并在本地 collector 设置相同的 `EXPMON_REMOTE_AGENT_TOKEN`。
+
+密码配置会按要求保存在本地，但非交互式连接测试和一次性 SSH 快照需要 `sshpass`，或者把配置切换为基于密钥的认证。
 
 ## 项目工作区
 

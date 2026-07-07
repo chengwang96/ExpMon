@@ -44,27 +44,27 @@ def main() -> None:
             assert projects[0]["name"] == "ExperimentA", projects[0]
             assert Path(projects[0]["path"]) == project_root.resolve(), projects[0]
 
-            dataset_root = workspace / "Dataset"
-            ards_root = dataset_root / "ARDS"
-            ards_cwd = ards_root / "expmon-frontend"
-            ards_cwd.mkdir(parents=True)
+            workspace_root = workspace / "WorkspaceRoot"
+            nested_project_root = workspace_root / "NestedProject"
+            nested_project_cwd = nested_project_root / "expmon-frontend"
+            nested_project_cwd.mkdir(parents=True)
             local_collector.CONFIG = {
                 **local_collector.CONFIG,
-                "experiment_roots": [str(dataset_root)],
+                "experiment_roots": [str(workspace_root)],
             }
-            ards_projects = local_collector.projects_from_runs([
+            nested_projects = local_collector.projects_from_runs([
                 {
-                    "id": "ards-run-1",
-                    "project": "ARDS",
-                    "cwd": str(ards_cwd),
+                    "id": "nested-run-1",
+                    "project": "NestedProject",
+                    "cwd": str(nested_project_cwd),
                     "status": "running",
                     "rootCreateTime": "2026-01-01 00:00:00",
                     "summary": {"gpuHours": 0, "avgGpuUtil": 0},
                 }
             ])
-            assert len(ards_projects) == 1, ards_projects
-            assert ards_projects[0]["name"] == "ARDS", ards_projects[0]
-            assert Path(ards_projects[0]["path"]) == ards_root.resolve(), ards_projects[0]
+            assert len(nested_projects) == 1, nested_projects
+            assert nested_projects[0]["name"] == "NestedProject", nested_projects[0]
+            assert Path(nested_projects[0]["path"]) == nested_project_root.resolve(), nested_projects[0]
 
             local_collector.CONFIG = {
                 **local_collector.CONFIG,

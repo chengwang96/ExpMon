@@ -1981,6 +1981,10 @@ body.is-card-dragging * {
   gap: 20px;
 }
 
+.host-connection-panel {
+  grid-column: 1 / -1;
+}
+
 .host-heading {
   display: flex;
   align-items: center;
@@ -2055,6 +2059,93 @@ body.is-card-dragging * {
   overflow-wrap: anywhere;
 }
 
+.host-memory-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(113, 128, 150, 0.16);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.host-memory-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.host-memory-head .panel-title {
+  margin-bottom: 0;
+}
+
+.host-memory-head > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.host-memory-panel p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.memory-breakdown-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 12px;
+}
+
+.memory-breakdown-row {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.memory-breakdown-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.memory-breakdown-label strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memory-breakdown-label span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.memory-breakdown-bar {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #edf2f7;
+}
+
+.memory-breakdown-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--amber));
+}
+
+.memory-breakdown-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .host-gpu-panel,
 .ssh-server-stack {
   display: grid;
@@ -2108,6 +2199,24 @@ body.is-card-dragging * {
   gap: 4px;
   padding-top: 8px;
   border-top: 1px solid rgba(113, 128, 150, 0.12);
+}
+
+.gpu-process-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 2px;
+}
+
+.gpu-process-summary strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.gpu-process-summary span {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .gpu-process-head,
@@ -3008,6 +3117,10 @@ body.is-card-dragging * {
     grid-template-columns: minmax(0, 1fr) repeat(2, minmax(0, 1fr));
   }
 
+  .memory-breakdown-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .gpu-process-head,
   .gpu-process-row,
   .run-gpu-process-head,
@@ -3121,6 +3234,7 @@ body.is-card-dragging * {
   .project-hero,
   .project-panel-head,
   .panel-title-row,
+  .host-memory-head,
   .visualization-controls {
     display: grid;
   }

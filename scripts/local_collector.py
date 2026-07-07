@@ -1,7 +1,9 @@
 import base64
+import getpass
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -15,7 +17,9 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
+from urllib.request import Request, urlopen
 
 import psutil
 
@@ -37,7 +41,36 @@ PROCESS_CPU_HISTORY: dict[int, tuple[float, float]] = {}
 RUN_IO_HISTORY: dict[str, tuple[float, float, float]] = {}
 HOST_IO_HISTORY: tuple[float, float, float, float, float] | None = None
 HOST_RESOURCE_HISTORY: dict[str, list[dict[str, Any]]] = {}
+REMOTE_AGENT_UNAVAILABLE_UNTIL: dict[str, float] = {}
 DELETABLE_RUN_STATUSES = {"finished", "failed", "killed"}
+
+NVIDIA_POWER_LIMIT_CATALOG_W = {
+    "rtx 5090": 575,
+    "rtx 5080": 360,
+    "rtx 4090 laptop": 150,
+    "rtx 4080 laptop": 150,
+    "rtx 4070 laptop": 115,
+    "rtx 4060 laptop": 115,
+    "rtx 4050 laptop": 115,
+    "rtx 4090": 450,
+    "rtx 4080 super": 320,
+    "rtx 4080": 320,
+    "rtx 4070 ti super": 285,
+    "rtx 4070 ti": 285,
+    "rtx 4070 super": 220,
+    "rtx 4070": 200,
+    "rtx 4060 ti": 160,
+    "rtx 4060": 115,
+    "rtx 3090 ti": 450,
+    "rtx 3090": 350,
+    "rtx 3080 ti": 350,
+    "rtx 3080": 320,
+    "rtx 3070 ti": 290,
+    "rtx 3070": 220,
+    "rtx 3060 ti": 200,
+    "rtx 3060": 170,
+    "rtx 3050": 130,
+}
 SSH_SERVERS_PATH = Path(os.environ.get("EXPMON_SSH_SERVERS", APP_ROOT / "expmon-ssh-servers.json"))
 RUN_METADATA_PATH = Path(os.environ.get("EXPMON_RUN_METADATA", APP_ROOT / "expmon-run-metadata.json"))
 VISUALIZATION_PROCESSES: dict[str, dict[str, Any]] = {}
@@ -488,10 +521,10 @@ def resolve_ssh_key_path(key_path: str) -> Path:
     return path
 
 
-def ssh_command_for_server(server: dict[str, Any], remote_command: str) -> tuple[list[str] | None, dict[str, Any] | None]:
+def ssh_base_command_for_server(server: dict[str, Any]) -> tuple[list[str] | None, str, dict[str, Any] | None]:
     auth_type = str(server.get("authType") or "key")
     if auth_type == "password" and not shutil.which("sshpass"):
-        return None, {
+        return None, "", {
             "ok": False,
             "supported": False,
             "server": public_ssh_server(server),
@@ -501,7 +534,7 @@ def ssh_command_for_server(server: dict[str, Any], remote_command: str) -> tuple
 
     ssh_binary = shutil.which("ssh")
     if not ssh_binary:
-        return None, {
+        return None, "", {
             "ok": False,
             "supported": False,
             "server": public_ssh_server(server),
@@ -525,11 +558,30 @@ def ssh_command_for_server(server: dict[str, Any], remote_command: str) -> tuple
     if auth_type == "key":
         key_path = str(server.get("keyPath") or "").strip()
         if not key_path:
-            return None, {"ok": False, "error": "keyPath is missing", "server": public_ssh_server(server)}
+            return None, "", {"ok": False, "error": "keyPath is missing", "server": public_ssh_server(server)}
         command.extend(["-o", "BatchMode=yes"])
         command.extend(["-i", str(resolve_ssh_key_path(key_path))])
     else:
         command = ["sshpass", "-p", str(server.get("password") or ""), *command]
+    return command, target, None
+
+
+def ssh_command_for_server(server: dict[str, Any], remote_command: str) -> tuple[list[str] | None, dict[str, Any] | None]:
+    command, target, error_payload = ssh_base_command_for_server(server)
+    if error_payload:
+        return None, error_payload
+    if not command:
+        return None, {"ok": False, "error": "failed to build ssh command", "server": public_ssh_server(server)}
+    command.extend([target, remote_command])
+    return command, None
+
+
+def ssh_stdin_command_for_server(server: dict[str, Any], remote_command: str) -> tuple[list[str] | None, dict[str, Any] | None]:
+    command, target, error_payload = ssh_base_command_for_server(server)
+    if error_payload:
+        return None, error_payload
+    if not command:
+        return None, {"ok": False, "error": "failed to build ssh command", "server": public_ssh_server(server)}
     command.extend([target, remote_command])
     return command, None
 
@@ -594,6 +646,52 @@ import platform
 import subprocess
 import time
 
+NVIDIA_POWER_LIMIT_CATALOG_W = {
+    "rtx 5090": 575,
+    "rtx 5080": 360,
+    "rtx 4090 laptop": 150,
+    "rtx 4080 laptop": 150,
+    "rtx 4070 laptop": 115,
+    "rtx 4060 laptop": 115,
+    "rtx 4050 laptop": 115,
+    "rtx 4090": 450,
+    "rtx 4080 super": 320,
+    "rtx 4080": 320,
+    "rtx 4070 ti super": 285,
+    "rtx 4070 ti": 285,
+    "rtx 4070 super": 220,
+    "rtx 4070": 200,
+    "rtx 4060 ti": 160,
+    "rtx 4060": 115,
+    "rtx 3090 ti": 450,
+    "rtx 3090": 350,
+    "rtx 3080 ti": 350,
+    "rtx 3080": 320,
+    "rtx 3070 ti": 290,
+    "rtx 3070": 220,
+    "rtx 3060 ti": 200,
+    "rtx 3060": 170,
+    "rtx 3050": 130,
+}
+
+
+def optional_float(value):
+    text = str(value or "").strip().lower()
+    if not text or "n/a" in text or "not supported" in text or "not available" in text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def catalog_power_limit_w(name):
+    normalized = " ".join(str(name or "").lower().replace("geforce", "").split())
+    for key, watts in NVIDIA_POWER_LIMIT_CATALOG_W.items():
+        if key in normalized:
+            return float(watts)
+    return None
+
 
 def cpu_snapshot():
     try:
@@ -626,10 +724,68 @@ def memory():
                 key, raw = line.split(":", 1)
                 values[key] = int(raw.strip().split()[0])
     except Exception:
-        return 0, 0
+        return macos_memory()
     total = values.get("MemTotal", 0) / 1024 / 1024
     available = values.get("MemAvailable", 0) / 1024 / 1024
-    return round(total - available, 2), round(total, 2)
+    rows = []
+    def row(key, label, value_kib, note):
+        if value_kib > 0 and values.get("MemTotal", 0) > 0:
+            value_gb = value_kib / 1024 / 1024
+            rows.append({
+                "key": key,
+                "label": label,
+                "valueGb": round(value_gb, 2),
+                "percent": round((value_kib / values.get("MemTotal", 1)) * 100, 1),
+                "note": note,
+            })
+    row("linux_used", "Used", max(0, values.get("MemTotal", 0) - values.get("MemAvailable", 0)), "Linux: MemTotal - MemAvailable")
+    row("linux_buffers", "Buffers", values.get("Buffers", 0), "Linux: block device buffers")
+    row("linux_cache", "Cache", values.get("Cached", 0) + values.get("SReclaimable", 0), "Linux: file cache plus reclaimable slab")
+    row("linux_shared", "Shared", values.get("Shmem", 0), "Linux: tmpfs/shared memory")
+    row("linux_available", "Available", values.get("MemAvailable", 0), "Linux: estimated memory available to new processes")
+    return round(total - available, 2), round(total, 2), rows
+
+
+def macos_memory():
+    if platform.system().lower() != "darwin":
+        return 0, 0, []
+    try:
+        page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True, timeout=2).strip())
+        total_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, timeout=2).strip())
+        output = subprocess.check_output(["vm_stat"], text=True, timeout=2)
+    except Exception:
+        return 0, 0, []
+    pages = {}
+    for line in output.splitlines():
+        if ":" not in line:
+            continue
+        key, raw = line.split(":", 1)
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if digits:
+            pages[key.strip()] = int(digits)
+    def page_bytes(name):
+        return pages.get(name, 0) * page_size
+    total_gb = total_bytes / 1024 / 1024 / 1024
+    inactive = page_bytes("Pages inactive")
+    free = page_bytes("Pages free")
+    speculative = page_bytes("Pages speculative")
+    available = inactive + free + speculative
+    rows = []
+    def row(key, label, value_bytes, note):
+        if value_bytes > 0 and total_bytes > 0:
+            rows.append({
+                "key": key,
+                "label": label,
+                "valueGb": round(value_bytes / 1024 / 1024 / 1024, 2),
+                "percent": round((value_bytes / total_bytes) * 100, 1),
+                "note": note,
+            })
+    row("macos_wired", "Wired", page_bytes("Pages wired down"), "macOS: memory that cannot be paged out")
+    row("macos_active", "Active", page_bytes("Pages active"), "macOS: recently used application memory")
+    row("macos_inactive", "Inactive", inactive, "macOS: reclaimable inactive memory")
+    row("macos_compressed", "Compressed", page_bytes("Pages occupied by compressor"), "macOS: memory compressed by the kernel")
+    row("macos_free", "Free", free + speculative, "macOS: unused and speculative pages")
+    return round(total_gb - (available / 1024 / 1024 / 1024), 2), round(total_gb, 2), rows
 
 
 def cpu_cores():
@@ -641,7 +797,7 @@ def cpu_cores():
 
 
 def gpus():
-    query = "index,uuid,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu"
+    query = "index,uuid,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,enforced.power.limit,temperature.gpu"
     try:
         result = subprocess.run(
             ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
@@ -656,12 +812,13 @@ def gpus():
     rows = []
     for line in result.stdout.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 9:
+        if len(parts) < 10:
             continue
         try:
             total = float(parts[3])
             used = float(parts[4])
             util = float(parts[5])
+            power_limit = optional_float(parts[7]) or optional_float(parts[8]) or catalog_power_limit_w(parts[2])
             rows.append({
                 "index": int(float(parts[0])),
                 "uuid": parts[1],
@@ -671,8 +828,9 @@ def gpus():
                 "memoryPercent": round((used / total) * 100, 1) if total else 0,
                 "utilization": util,
                 "powerDrawW": float(parts[6] or 0),
-                "powerLimitW": float(parts[7] or 0),
-                "temperatureC": float(parts[8] or 0),
+                "powerLimitW": power_limit,
+                "powerLimitSource": "nvidia-smi" if (optional_float(parts[7]) or optional_float(parts[8])) else ("catalog" if power_limit else "unknown"),
+                "temperatureC": float(parts[9] or 0),
                 "busy": util > 0 or used > 0,
                 "processes": [],
             })
@@ -681,7 +839,7 @@ def gpus():
     return rows
 
 
-memory_used, memory_total = memory()
+memory_used, memory_total, memory_breakdown = memory()
 gpu_rows = gpus()
 print(json.dumps({
     "hostname": platform.node(),
@@ -691,6 +849,7 @@ print(json.dumps({
     "cores": cpu_cores(),
     "memoryUsedGb": memory_used,
     "memoryTotalGb": memory_total,
+    "memoryBreakdown": memory_breakdown,
     "gpus": gpu_rows,
     "gpusTotal": len(gpu_rows),
     "gpusBusy": sum(1 for gpu in gpu_rows if gpu.get("busy")),
@@ -726,6 +885,12 @@ def detect_remote_os(server: dict[str, Any]) -> str:
             return "macos"
         if "linux" in value:
             return "linux"
+    completed, _, _ = run_ssh_remote_command(server, "powershell -NoProfile -Command \"[System.Environment]::OSVersion.VersionString\"", timeout=6)
+    if completed and completed.returncode == 0 and "windows" in (completed.stdout + completed.stderr).lower():
+        return "windows"
+    completed, _, _ = run_ssh_remote_command(server, "cmd /c ver", timeout=6)
+    if completed and completed.returncode == 0 and "windows" in (completed.stdout + completed.stderr).lower():
+        return "windows"
     completed, _, _ = run_ssh_remote_command(server, "ver", timeout=6)
     if completed and completed.returncode == 0 and "windows" in (completed.stdout + completed.stderr).lower():
         return "windows"
@@ -749,21 +914,137 @@ $cpuUsage = 0
 if ($loadValues.Count -gt 0) { $cpuUsage = [Math]::Round(($loadValues | Measure-Object -Average).Average, 1) }
 $memoryTotal = 0
 $memoryUsed = 0
+$memoryBreakdown = @()
 if ($os) {
   $memoryTotal = [Math]::Round([double]$os.TotalVisibleMemorySize / 1048576, 2)
   $memoryUsed = [Math]::Round(([double]$os.TotalVisibleMemorySize - [double]$os.FreePhysicalMemory) / 1048576, 2)
 }
+function To-Number($value) {
+  if ($null -eq $value) { return 0 }
+  $text = [string]$value
+  $clean = $text -replace '[^0-9\.\-]',''
+  if ([string]::IsNullOrWhiteSpace($clean)) { return 0 }
+  try { return [double]$clean } catch { return 0 }
+}
+function To-OptionalNumber($value) {
+  if ($null -eq $value) { return $null }
+  $text = ([string]$value).Trim().ToLowerInvariant()
+  if ([string]::IsNullOrWhiteSpace($text) -or $text.Contains('n/a') -or $text.Contains('not supported') -or $text.Contains('not available')) { return $null }
+  $clean = $text -replace '[^0-9\.\-]',''
+  if ([string]::IsNullOrWhiteSpace($clean)) { return $null }
+  try { return [double]$clean } catch { return $null }
+}
+function Add-MemoryRow($key, $label, $valueGb, $note) {
+  if ($null -eq $valueGb -or $valueGb -le 0 -or $memoryTotal -le 0) { return }
+  $script:memoryBreakdown += [pscustomobject]@{
+    key = $key
+    label = $label
+    valueGb = [Math]::Round([double]$valueGb, 2)
+    percent = [Math]::Round(([double]$valueGb / [double]$memoryTotal) * 100, 1)
+    note = $note
+  }
+}
+$memoryPerf = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory
+Add-MemoryRow 'windows_used' 'In use' $memoryUsed 'Windows: TotalVisibleMemorySize - FreePhysicalMemory'
+if ($os) { Add-MemoryRow 'windows_available' 'Available' ([double]$os.FreePhysicalMemory / 1048576) 'Windows: memory immediately available without paging' }
+if ($memoryPerf) {
+  Add-MemoryRow 'windows_cache' 'Cache' ((To-Number $memoryPerf.CacheBytes) / 1073741824) 'Windows: system cache bytes'
+  Add-MemoryRow 'windows_committed' 'Committed' ((To-Number $memoryPerf.CommittedBytes) / 1073741824) 'Windows: committed virtual memory, may exceed physical RAM'
+}
+function Catalog-PowerLimit($name) {
+  $normalized = (([string]$name).ToLowerInvariant() -replace 'geforce','') -replace '\s+',' '
+  $catalog = [ordered]@{
+    'rtx 5090' = 575
+    'rtx 5080' = 360
+    'rtx 4090 laptop' = 150
+    'rtx 4080 laptop' = 150
+    'rtx 4070 laptop' = 115
+    'rtx 4060 laptop' = 115
+    'rtx 4050 laptop' = 115
+    'rtx 4090' = 450
+    'rtx 4080 super' = 320
+    'rtx 4080' = 320
+    'rtx 4070 ti super' = 285
+    'rtx 4070 ti' = 285
+    'rtx 4070 super' = 220
+    'rtx 4070' = 200
+    'rtx 4060 ti' = 160
+    'rtx 4060' = 115
+    'rtx 3090 ti' = 450
+    'rtx 3090' = 350
+    'rtx 3080 ti' = 350
+    'rtx 3080' = 320
+    'rtx 3070 ti' = 290
+    'rtx 3070' = 220
+    'rtx 3060 ti' = 200
+    'rtx 3060' = 170
+    'rtx 3050' = 130
+  }
+  foreach ($key in $catalog.Keys) {
+    if ($normalized.Contains($key)) { return [double]$catalog[$key] }
+  }
+  return $null
+}
+$perfProcessors = @(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | Where-Object { $_.Name -ne '_Total' } | Sort-Object { [int]$_.Name })
+if ($perfProcessors.Count -gt 0) {
+  $cores = @($perfProcessors | ForEach-Object { [Math]::Round((To-Number $_.PercentProcessorTime), 1) })
+  $totalPerfProcessor = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+  if ($totalPerfProcessor) { $cpuUsage = [Math]::Round((To-Number $totalPerfProcessor.PercentProcessorTime), 1) }
+} else {
+  $cores = @(0..([Math]::Max($logical - 1, 0)) | ForEach-Object { 0 })
+}
+$diskPerf = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+$diskRead = 0
+$diskWrite = 0
+if ($diskPerf) {
+  $diskRead = [Math]::Round((To-Number $diskPerf.DiskReadBytesPersec) / 1048576, 2)
+  $diskWrite = [Math]::Round((To-Number $diskPerf.DiskWriteBytesPersec) / 1048576, 2)
+}
+$netPerf = @(Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface)
+$netRx = 0
+$netTx = 0
+foreach ($adapter in $netPerf) {
+  $name = [string]$adapter.Name
+  if ($name -match 'Loopback|isatap|Teredo') { continue }
+  $netRx += (To-Number $adapter.BytesReceivedPersec)
+  $netTx += (To-Number $adapter.BytesSentPersec)
+}
+$netRx = [Math]::Round($netRx / 1048576, 2)
+$netTx = [Math]::Round($netTx / 1048576, 2)
+$topProcesses = @()
+$perfProcesses = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process |
+  Where-Object { $_.IDProcess -gt 0 -and $_.Name -notin @('Idle', '_Total') } |
+  Sort-Object PercentProcessorTime -Descending |
+  Select-Object -First 8)
+foreach ($process in $perfProcesses) {
+  $pidValue = [int]$process.IDProcess
+  $name = [string]$process.Name
+  $topProcesses += [pscustomobject]@{
+    pid = $pidValue
+    name = $name
+    command = $name
+    cpu = [Math]::Round((To-Number $process.PercentProcessorTime), 1)
+    memoryGb = [Math]::Round((To-Number $process.WorkingSetPrivate) / 1073741824, 3)
+  }
+}
 $gpuRows = @()
 $nvidia = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if ($nvidia) {
-  $query = 'index,uuid,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu'
+  $query = 'index,uuid,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,enforced.power.limit,temperature.gpu'
   $lines = & $nvidia.Source "--query-gpu=$query" "--format=csv,noheader,nounits" 2>$null
   foreach ($line in $lines) {
     $parts = @($line -split ',' | ForEach-Object { $_.Trim() })
-    if ($parts.Count -ge 9) {
-      $total = [double]($parts[3] -replace '[^0-9\.]','')
-      $used = [double]($parts[4] -replace '[^0-9\.]','')
-      $util = [double]($parts[5] -replace '[^0-9\.]','')
+    if ($parts.Count -ge 10) {
+      $total = To-Number $parts[3]
+      $used = To-Number $parts[4]
+      $util = To-Number $parts[5]
+      $powerLimit = To-OptionalNumber $parts[7]
+      if ($null -eq $powerLimit) { $powerLimit = To-OptionalNumber $parts[8] }
+      $powerLimitSource = $(if ($null -ne $powerLimit) { 'nvidia-smi' } else { 'unknown' })
+      if ($null -eq $powerLimit) {
+        $powerLimit = Catalog-PowerLimit $parts[2]
+        if ($null -ne $powerLimit) { $powerLimitSource = 'catalog' }
+      }
       $gpuRows += [pscustomobject]@{
         index = [int]$parts[0]
         uuid = $parts[1]
@@ -772,12 +1053,34 @@ if ($nvidia) {
         memoryUsedMiB = $used
         memoryPercent = $(if ($total -gt 0) { [Math]::Round(($used / $total) * 100, 1) } else { 0 })
         utilization = $util
-        powerDrawW = [double]($parts[6] -replace '[^0-9\.]','')
-        powerLimitW = [double]($parts[7] -replace '[^0-9\.]','')
-        temperatureC = [double]($parts[8] -replace '[^0-9\.]','')
+        powerDrawW = To-Number $parts[6]
+        powerLimitW = $powerLimit
+        powerLimitSource = $powerLimitSource
+        temperatureC = To-Number $parts[9]
         busy = ($util -gt 0 -or $used -gt 0)
         processes = @()
       }
+    }
+  }
+  $processLines = & $nvidia.Source "--query-compute-apps=pid,process_name,used_memory,gpu_uuid" "--format=csv,noheader,nounits" 2>$null
+  foreach ($line in $processLines) {
+    $parts = @($line -split ',' | ForEach-Object { $_.Trim() })
+    if ($parts.Count -lt 4) { continue }
+    $gpuUuid = $parts[3]
+    $gpuIndex = 0
+    foreach ($gpu in $gpuRows) {
+      if ($gpu.uuid -eq $gpuUuid) { $gpuIndex = $gpu.index }
+    }
+    $gpuProcess = [pscustomobject]@{
+      pid = [int](To-Number $parts[0])
+      name = [System.IO.Path]::GetFileName($parts[1])
+      command = $parts[1]
+      usedMemoryMiB = To-Number $parts[2]
+      gpuUuid = $gpuUuid
+      gpuIndex = $gpuIndex
+    }
+    foreach ($gpu in $gpuRows) {
+      if ($gpu.uuid -eq $gpuUuid) { $gpu.processes += $gpuProcess }
     }
   }
 }
@@ -786,9 +1089,15 @@ if ($nvidia) {
   os = "windows / $($os.Caption)"
   user = $env:USERNAME
   cpuUsage = $cpuUsage
-  cores = @(0..([Math]::Max($logical - 1, 0)) | ForEach-Object { 0 })
+  cores = $cores
   memoryUsedGb = $memoryUsed
   memoryTotalGb = $memoryTotal
+  memoryBreakdown = $memoryBreakdown
+  diskRead = $diskRead
+  diskWrite = $diskWrite
+  netRx = $netRx
+  netTx = $netTx
+  processes = $topProcesses
   gpus = $gpuRows
   gpusTotal = $gpuRows.Count
   gpusBusy = @($gpuRows | Where-Object { $_.busy }).Count
@@ -798,6 +1107,12 @@ if ($nvidia) {
 
 def windows_resource_command() -> str:
     encoded = base64.b64encode(WINDOWS_RESOURCE_SCRIPT.encode("utf-16le")).decode("ascii")
+    return f"powershell -NoProfile -EncodedCommand {encoded}"
+
+
+def windows_stdin_resource_command() -> str:
+    bootstrap = "$s=[Console]::In.ReadToEnd(); Invoke-Expression $s"
+    encoded = base64.b64encode(bootstrap.encode("utf-16le")).decode("ascii")
     return f"powershell -NoProfile -EncodedCommand {encoded}"
 
 
@@ -832,17 +1147,126 @@ def posix_resource_command() -> str:
     )
 
 
+def remote_host_payload(
+    server_id: str,
+    server: dict[str, Any],
+    parsed: dict[str, Any],
+    *,
+    sampled_at: str,
+    latency_ms: int,
+    remote_os: str,
+    python_path: str = "",
+    source: str = "ssh",
+) -> dict[str, Any]:
+    host = {
+        "id": f"ssh:{server_id}",
+        "name": str(server.get("name") or parsed.get("hostname") or server.get("host") or "remote"),
+        "os": str(parsed.get("os") or remote_os or "remote"),
+        "address": str(server.get("host") or ""),
+        "user": str(parsed.get("user") or server.get("username") or ""),
+        "cpuUsage": float(parsed.get("cpuUsage") or 0),
+        "memoryUsedGb": float(parsed.get("memoryUsedGb") or 0),
+        "memoryTotalGb": float(parsed.get("memoryTotalGb") or 0),
+        "memoryBreakdown": parsed.get("memoryBreakdown") if isinstance(parsed.get("memoryBreakdown"), list) else [],
+        "gpusTotal": int(parsed.get("gpusTotal") or 0),
+        "gpusBusy": int(parsed.get("gpusBusy") or 0),
+        "gpus": parsed.get("gpus") if isinstance(parsed.get("gpus"), list) else [],
+        "diskRead": float(parsed.get("diskRead") or 0),
+        "diskWrite": float(parsed.get("diskWrite") or 0),
+        "netRx": float(parsed.get("netRx") or 0),
+        "netTx": float(parsed.get("netTx") or 0),
+        "runningRuns": 0,
+        "warnings": [],
+        "cores": parsed.get("cores") if isinstance(parsed.get("cores"), list) else [],
+        "processes": parsed.get("processes") if isinstance(parsed.get("processes"), list) else [],
+    }
+    host["history"] = update_host_history(
+        str(host["id"]),
+        {
+            "time": format_clock(),
+            "ts": sampled_at,
+            "read": host["diskRead"],
+            "write": host["diskWrite"],
+            "rx": host["netRx"],
+            "tx": host["netTx"],
+        },
+    )
+    return {
+        "ok": True,
+        "supported": True,
+        "server": public_ssh_server(server),
+        "sampledAt": sampled_at,
+        "latencyMs": latency_ms,
+        "remoteOs": remote_os,
+        "pythonPath": python_path,
+        "host": host,
+        "source": source,
+        "message": "remote agent snapshot ok" if source == "agent" else "remote resource snapshot ok",
+    }
+
+
+def remote_agent_snapshot(server_id: str, server: dict[str, Any]) -> dict[str, Any] | None:
+    host = str(server.get("host") or "").strip()
+    if not host:
+        return None
+    now = time.time()
+    unavailable_until = REMOTE_AGENT_UNAVAILABLE_UNTIL.get(server_id, 0)
+    if unavailable_until > now:
+        return None
+    port = int(os.environ.get("EXPMON_REMOTE_AGENT_PORT", "5194"))
+    url = f"http://{host}:{port}/api/host"
+    headers = {"Accept": "application/json"}
+    token = os.environ.get("EXPMON_REMOTE_AGENT_TOKEN", "").strip()
+    if token:
+        headers["X-ExpMon-Agent-Token"] = token
+    started = time.time()
+    try:
+        with urlopen(Request(url, headers=headers), timeout=2.5) as response:
+            raw = response.read(1024 * 1024).decode("utf-8", errors="replace")
+    except (OSError, HTTPError, URLError):
+        REMOTE_AGENT_UNAVAILABLE_UNTIL[server_id] = now + 60
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        REMOTE_AGENT_UNAVAILABLE_UNTIL[server_id] = now + 60
+        return None
+    if not isinstance(parsed, dict) or not parsed:
+        REMOTE_AGENT_UNAVAILABLE_UNTIL[server_id] = now + 60
+        return None
+    REMOTE_AGENT_UNAVAILABLE_UNTIL.pop(server_id, None)
+    return remote_host_payload(
+        server_id,
+        server,
+        parsed,
+        sampled_at=str(parsed.get("sampledAt") or datetime.now().isoformat(timespec="seconds")),
+        latency_ms=int((time.time() - started) * 1000),
+        remote_os=str(parsed.get("remoteOs") or parsed.get("os") or "agent"),
+        python_path=str(parsed.get("pythonPath") or ""),
+        source="agent",
+    )
+
+
 def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
     server = ssh_server_by_id(server_id)
     if not server:
         return 404, {"ok": False, "error": "ssh server not found"}
 
+    agent_payload = remote_agent_snapshot(server_id, server)
+    if agent_payload:
+        return 200, agent_payload
+
     remote_os = detect_remote_os(server)
     if remote_os == "windows":
-        remote_command = windows_resource_command()
+        remote_command = windows_stdin_resource_command()
+        command, error_payload = ssh_stdin_command_for_server(server, remote_command)
+        stdin_text = WINDOWS_RESOURCE_SCRIPT
+        command_timeout = 30
     else:
         remote_command = posix_resource_command()
-    command, error_payload = ssh_command_for_server(server, remote_command)
+        command, error_payload = ssh_command_for_server(server, remote_command)
+        stdin_text = None
+        command_timeout = 15
     if error_payload:
         return 400 if error_payload.get("error") else 200, error_payload
     if not command:
@@ -856,7 +1280,8 @@ def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
             encoding="utf-8",
             errors="replace",
             capture_output=True,
-            timeout=15,
+            input=stdin_text,
+            timeout=command_timeout,
         )
     except subprocess.TimeoutExpired:
         return 200, {
@@ -893,37 +1318,16 @@ def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
             "message": stderr or stdout or f"ssh exited with {completed.returncode}",
         }
 
-    host = {
-        "id": f"ssh:{server_id}",
-        "name": str(server.get("name") or parsed.get("hostname") or server.get("host") or "remote"),
-        "os": str(parsed.get("os") or "remote"),
-        "address": str(server.get("host") or ""),
-        "user": str(parsed.get("user") or server.get("username") or ""),
-        "cpuUsage": float(parsed.get("cpuUsage") or 0),
-        "memoryUsedGb": float(parsed.get("memoryUsedGb") or 0),
-        "memoryTotalGb": float(parsed.get("memoryTotalGb") or 0),
-        "gpusTotal": int(parsed.get("gpusTotal") or 0),
-        "gpusBusy": int(parsed.get("gpusBusy") or 0),
-        "gpus": parsed.get("gpus") if isinstance(parsed.get("gpus"), list) else [],
-        "diskRead": 0,
-        "diskWrite": 0,
-        "netRx": 0,
-        "netTx": 0,
-        "runningRuns": 0,
-        "warnings": [],
-        "cores": parsed.get("cores") if isinstance(parsed.get("cores"), list) else [],
-    }
-    return 200, {
-        "ok": True,
-        "supported": True,
-        "server": public_ssh_server(server),
-        "sampledAt": datetime.now().isoformat(timespec="seconds"),
-        "latencyMs": int((time.time() - started) * 1000),
-        "remoteOs": remote_os,
-        "pythonPath": python_path,
-        "host": host,
-        "message": "remote resource snapshot ok",
-    }
+    return 200, remote_host_payload(
+        server_id,
+        server,
+        parsed,
+        sampled_at=datetime.now().isoformat(timespec="seconds"),
+        latency_ms=int((time.time() - started) * 1000),
+        remote_os=remote_os,
+        python_path=python_path,
+        source="ssh",
+    )
 
 
 def mib(value: float) -> float:
@@ -934,11 +1338,126 @@ def gb(value: float) -> float:
     return round(value / 1024 / 1024 / 1024, 2)
 
 
+def memory_breakdown_from_psutil(memory: Any) -> list[dict[str, Any]]:
+    total = float(getattr(memory, "total", 0) or 0)
+    if total <= 0:
+        return []
+
+    def row(key: str, label: str, value: float, note: str = "") -> dict[str, Any] | None:
+        value = float(value or 0)
+        if value < 0:
+            return None
+        return {
+            "key": key,
+            "label": label,
+            "valueGb": gb(value),
+            "percent": round((value / total) * 100, 1) if total else 0,
+            "note": note,
+        }
+
+    rows: list[dict[str, Any] | None]
+    if sys.platform.startswith("win"):
+        rows = [
+            row("windows_used", "In use", getattr(memory, "used", 0), "Windows: committed physical memory in use"),
+            row("windows_available", "Available", getattr(memory, "available", 0), "Windows: immediately available without paging"),
+            *windows_memory_counter_rows(row),
+        ]
+    elif sys.platform == "darwin":
+        rows = [
+            row("macos_wired", "Wired", getattr(memory, "wired", 0), "macOS: memory that cannot be paged out"),
+            row("macos_active", "Active", getattr(memory, "active", 0), "macOS: recently used application memory"),
+            row("macos_inactive", "Inactive", getattr(memory, "inactive", 0), "macOS: reclaimable inactive memory"),
+            row("macos_compressed", "Compressed", getattr(memory, "compressed", 0), "macOS: memory compressed by the kernel"),
+            row("macos_free", "Free", getattr(memory, "free", 0), "macOS: unused pages"),
+        ]
+    elif sys.platform.startswith("linux"):
+        rows = linux_memory_proc_rows(row) or [
+            row("linux_used", "Used", max(0, total - float(getattr(memory, "available", 0) or 0)), "Linux: total - available"),
+            row("linux_buffers", "Buffers", getattr(memory, "buffers", 0), "Linux: block device buffers"),
+            row("linux_cache", "Cache", getattr(memory, "cached", 0), "Linux: file cache and reclaimable cache"),
+            row("linux_shared", "Shared", getattr(memory, "shared", 0), "Linux: tmpfs/shared memory"),
+            row("linux_available", "Available", getattr(memory, "available", 0), "Linux: estimated memory available to new processes"),
+        ]
+    else:
+        rows = [
+            row("used", "Used", getattr(memory, "used", 0)),
+            row("available", "Available", getattr(memory, "available", 0)),
+            row("free", "Free", getattr(memory, "free", 0)),
+        ]
+    return [item for item in rows if item and item["valueGb"] > 0]
+
+
+def windows_memory_counter_rows(row: Any) -> list[dict[str, Any] | None]:
+    command = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory | "
+        "Select-Object CacheBytes,CommittedBytes | ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+        parsed = json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else {}
+    except Exception:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    return [
+        row("windows_cache", "Cache", to_float(parsed.get("CacheBytes")), "Windows: system cache bytes"),
+        row("windows_committed", "Committed", to_float(parsed.get("CommittedBytes")), "Windows: committed virtual memory, may exceed physical RAM"),
+    ]
+
+
+def linux_memory_proc_rows(row: Any) -> list[dict[str, Any] | None]:
+    values: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                key, raw = line.split(":", 1)
+                values[key] = int(raw.strip().split()[0])
+    except Exception:
+        return []
+    total = values.get("MemTotal", 0)
+    if total <= 0:
+        return []
+    kib = 1024
+    return [
+        row("linux_used", "Used", max(0, total - values.get("MemAvailable", 0)) * kib, "Linux: MemTotal - MemAvailable"),
+        row("linux_buffers", "Buffers", values.get("Buffers", 0) * kib, "Linux: block device buffers"),
+        row("linux_cache", "Cache", (values.get("Cached", 0) + values.get("SReclaimable", 0)) * kib, "Linux: file cache plus reclaimable slab"),
+        row("linux_shared", "Shared", values.get("Shmem", 0) * kib, "Linux: tmpfs/shared memory"),
+        row("linux_available", "Available", values.get("MemAvailable", 0) * kib, "Linux: estimated memory available to new processes"),
+    ]
+
+
 def to_float(value: Any) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def optional_float(value: Any) -> float | None:
+    text = str(value or "").strip().lower()
+    if not text or "n/a" in text or "not supported" in text or "not available" in text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def catalog_power_limit_w(name: str) -> float | None:
+    normalized = " ".join(str(name or "").lower().replace("geforce", "").split())
+    for key, watts in NVIDIA_POWER_LIMIT_CATALOG_W.items():
+        if key in normalized:
+            return float(watts)
+    return None
 
 
 def norm_text_path(value: str | Path | None) -> str:
@@ -1606,7 +2125,7 @@ def gpu_samples() -> list[dict[str, Any]]:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,temperature.gpu",
+                "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,power.draw,power.limit,enforced.power.limit,temperature.gpu",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -1620,11 +2139,16 @@ def gpu_samples() -> list[dict[str, Any]]:
             if not line.strip():
                 continue
             parts = [part.strip() for part in line.split(",")]
-            if len(parts) < 9:
+            if len(parts) < 10:
                 continue
             used = to_float(parts[4])
             total = to_float(parts[3])
             util = to_float(parts[5])
+            power_limit = optional_float(parts[7]) or optional_float(parts[8])
+            power_limit_source = "nvidia-smi" if power_limit else "unknown"
+            if power_limit is None:
+                power_limit = catalog_power_limit_w(parts[2])
+                power_limit_source = "catalog" if power_limit else "unknown"
             gpus.append(
                 {
                     "index": int(to_float(parts[0])),
@@ -1635,8 +2159,9 @@ def gpu_samples() -> list[dict[str, Any]]:
                     "memoryPercent": round((used / total) * 100, 1) if total else 0,
                     "utilization": util,
                     "powerDrawW": to_float(parts[6]),
-                    "powerLimitW": to_float(parts[7]),
-                    "temperatureC": to_float(parts[8]),
+                    "powerLimitW": power_limit,
+                    "powerLimitSource": power_limit_source,
+                    "temperatureC": to_float(parts[9]),
                     "busy": util > 0 or used > 0,
                     "processes": [],
                 }
@@ -3083,12 +3608,13 @@ def collect_snapshot() -> dict[str, Any]:
             {
                 "id": host_id,
                 "name": "Local Host",
-                "os": f"{os.name} / {socket.gethostname()}",
+                "os": platform.platform(),
                 "address": "127.0.0.1",
-                "user": os.environ.get("USERNAME") or "local",
+                "user": getpass.getuser(),
                 "cpuUsage": round(psutil.cpu_percent(interval=None), 1),
                 "memoryUsedGb": gb(memory.used),
                 "memoryTotalGb": gb(memory.total),
+                "memoryBreakdown": memory_breakdown_from_psutil(memory),
                 "gpusTotal": gpu_total,
                 "gpusBusy": gpu_busy,
                 "gpus": gpus,

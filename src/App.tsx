@@ -70,6 +70,7 @@ type Host = {
   cpuUsage: number;
   memoryUsedGb: number;
   memoryTotalGb: number;
+  memoryBreakdown?: MemoryBreakdown[];
   gpusTotal: number;
   gpusBusy: number;
   gpus?: GpuSample[];
@@ -81,6 +82,15 @@ type Host = {
   warnings: string[];
   cores: number[];
   history?: Array<Record<string, number | string>>;
+  processes?: HostProcess[];
+};
+
+type MemoryBreakdown = {
+  key: string;
+  label: string;
+  valueGb: number;
+  percent: number;
+  note?: string;
 };
 
 type GpuSample = {
@@ -92,7 +102,8 @@ type GpuSample = {
   memoryPercent: number;
   utilization: number;
   powerDrawW: number;
-  powerLimitW: number;
+  powerLimitW?: number | null;
+  powerLimitSource?: "nvidia-smi" | "catalog" | "unknown" | string;
   temperatureC: number;
   busy: boolean;
   processes?: GpuProcess[];
@@ -197,6 +208,14 @@ type ProcessNode = {
   memoryGb: number;
   role: string;
   children?: ProcessNode[];
+};
+
+type HostProcess = {
+  pid: number;
+  name: string;
+  command?: string;
+  cpu: number;
+  memoryGb: number;
 };
 
 type RunVisualization = {
@@ -510,6 +529,9 @@ const TEXT = {
     remoteResourcesNotLoaded: "远端资源尚未读取",
     remoteResourceLoadFailed: "远端资源读取失败",
     systemMemory: "系统内存",
+    memoryBreakdown: "内存分类",
+    memoryBreakdownHint: "不同系统的内存定义不同，下面按系统原始语义展示。",
+    memoryBreakdownUnavailable: "暂无内存分类采样",
     notOccupied: "未占用",
     notDetected: "未检测",
     notConnected: "采集器未连接",
@@ -724,6 +746,9 @@ const TEXT = {
     remoteResourcesNotLoaded: "remote resources not loaded",
     remoteResourceLoadFailed: "remote resource loading failed",
     systemMemory: "System Memory",
+    memoryBreakdown: "Memory Breakdown",
+    memoryBreakdownHint: "Memory categories differ by OS; rows keep the source system semantics.",
+    memoryBreakdownUnavailable: "No memory breakdown samples",
     notOccupied: "not occupied",
     notDetected: "not detected",
     notConnected: "collector offline",
@@ -1247,10 +1272,17 @@ function App() {
       .finally(() => setConfigSaveInFlight(false));
   }, [language, refreshSnapshot]);
 
-  const handleRemoteHostRefresh = useCallback((host: Host, navigate = true) => {
+  const handleRemoteHostRefresh = useCallback((host: Host, navigate = true, preserveExisting = false) => {
     updateRemoteHosts((current) => {
+      const existing = current.find((item) => item.id === host.id);
+      const nextHost = preserveExisting && existing
+        ? {
+            ...existing,
+            warnings: host.warnings.length ? host.warnings : existing.warnings,
+          }
+        : host;
       const next = current.filter((item) => item.id !== host.id);
-      return [...next, host];
+      return [...next, nextHost];
     });
     if (navigate) {
       setSelectedHostId(host.id);
@@ -1280,11 +1312,11 @@ function App() {
         if (payload.ok && payload.host) {
           handleRemoteHostRefresh(payload.host, false);
         } else {
-          handleRemoteHostRefresh(hostFromSshServer(server, payload, "failed"), false);
+          handleRemoteHostRefresh(hostFromSshServer(server, payload, "failed"), false, true);
         }
       })
       .catch((error: Error) => {
-        handleRemoteHostRefresh(hostFromSshServer(server, { ok: false, error: error.message, message: error.message }, "failed"), false);
+        handleRemoteHostRefresh(hostFromSshServer(server, { ok: false, error: error.message, message: error.message }, "failed"), false, true);
       })
       .finally(() => {
         sshResourceInFlightRef.current.delete(server.id);
@@ -2406,10 +2438,15 @@ function HostsView({
   const [historyRange, setHistoryRange] = useState<TimeRange>("15m");
   const [showSshForm, setShowSshForm] = useState(false);
   const hostRuns = runs.filter((run) => run.hostId === selectedHost.id);
-  const topProcesses = hostRuns
-    .flatMap((run) => flattenProcessTree(run.processTree).map((proc) => ({ ...proc, run: run.name })))
-    .sort((a, b) => b.cpu - a.cpu)
-    .slice(0, 8);
+  const topProcesses = selectedHost.processes?.length
+    ? selectedHost.processes
+        .map((proc) => ({ ...proc, run: "", role: "remote" }))
+        .sort((a, b) => b.cpu - a.cpu)
+        .slice(0, 8)
+    : hostRuns
+        .flatMap((run) => flattenProcessTree(run.processTree).map((proc) => ({ ...proc, run: run.name, command: undefined })))
+        .sort((a, b) => b.cpu - a.cpu)
+        .slice(0, 8);
   const memoryPercent = selectedHost.memoryTotalGb
     ? Math.round((selectedHost.memoryUsedGb / selectedHost.memoryTotalGb) * 100)
     : 0;
@@ -2479,22 +2516,11 @@ function HostsView({
             <HostMetricTile icon={Workflow} label={t("runsLabel")} value={`${selectedHost.runningRuns}`} detail={`${hostRuns.length} ${t("visibleOnHost")}`} />
             <HostMetricTile icon={AlertTriangle} label={t("warnings")} value={`${selectedHost.warnings.length}`} detail={formatHostWarning(selectedHost.warnings[0], t) ?? t("normal")} />
           </div>
+          <HostMemoryPanel host={selectedHost} />
           <HostGpuPanel host={selectedHost} />
         </div>
 
-        {selectedSshServer && (
-          <div className="panel">
-            <PanelTitle icon={Server} title={t("sshServers")} />
-            <SshServerPanel
-              servers={[selectedSshServer]}
-              onDelete={onDeleteSshServer}
-              onRemoteHostRefresh={onRemoteHostRefresh}
-              deletingId={sshDeleteInFlight}
-            />
-          </div>
-        )}
-
-        <div className="panel">
+        <div className="panel host-core-panel">
           <PanelTitle icon={Cpu} title={t("perCoreCpu")} />
           <div className="core-grid">
             {selectedHost.cores.map((value, index) => (
@@ -2506,7 +2532,7 @@ function HostsView({
           </div>
         </div>
 
-        <div className="panel">
+        <div className="panel host-io-panel">
           <div className="panel-title-row">
             <PanelTitle icon={HardDrive} title={t("diskNetwork")} />
             <TimeRangePicker value={historyRange} onChange={setHistoryRange} />
@@ -2525,12 +2551,12 @@ function HostsView({
           </ResponsiveContainer>
         </div>
 
-        <div className="panel">
+        <div className="panel host-process-panel">
           <PanelTitle icon={ListFilter} title={t("topProcesses")} />
           {topProcesses.length ? (
             <div className="process-table">
               {topProcesses.map((process) => (
-              <div key={`${process.pid}-${process.name}`} className="process-row">
+              <div key={`${process.pid}-${process.name}`} className="process-row" title={process.command || process.name}>
                 <span>{process.pid}</span>
                 <strong>{process.name}</strong>
                 <em>{process.cpu}%</em>
@@ -2545,6 +2571,18 @@ function HostsView({
             />
           )}
         </div>
+
+        {selectedSshServer && (
+          <div className="panel host-connection-panel">
+            <PanelTitle icon={Server} title={t("sshServers")} />
+            <SshServerPanel
+              servers={[selectedSshServer]}
+              onDelete={onDeleteSshServer}
+              onRemoteHostRefresh={onRemoteHostRefresh}
+              deletingId={sshDeleteInFlight}
+            />
+          </div>
+        )}
       </div>
       {showSshForm && (
         <SshServerDialog
@@ -3918,6 +3956,31 @@ function canDeleteRunRecord(run: Run) {
   return run.accessLevel === "A" && ["finished", "failed", "killed"].includes(run.status);
 }
 
+function importantGpuProcesses(processes: GpuProcess[]) {
+  return [...processes]
+    .filter((process) => process.usedMemoryMiB >= 64 || Boolean(process.runId) || process.role === "notebook")
+    .sort((left, right) => right.usedMemoryMiB - left.usedMemoryMiB)
+    .slice(0, 5);
+}
+
+function formatGpuPower(gpu: GpuSample) {
+  return gpu.powerLimitW && gpu.powerLimitW > 0
+    ? `${gpu.powerDrawW} / ${gpu.powerLimitW} W${gpu.powerLimitSource === "catalog" ? "*" : ""}`
+    : `${gpu.powerDrawW} W / limit n/a`;
+}
+
+function gpuPowerPercent(gpu: GpuSample) {
+  return gpu.powerLimitW && gpu.powerLimitW > 0 ? (gpu.powerDrawW / gpu.powerLimitW) * 100 : 0;
+}
+
+function formatGpuPowerDetail(gpu: GpuSample) {
+  if (gpu.powerLimitW && gpu.powerLimitW > 0) {
+    const suffix = gpu.powerLimitSource === "catalog" ? " (catalog)" : "";
+    return `${gpu.powerDrawW.toFixed(0)} / ${gpu.powerLimitW.toFixed(0)} W${suffix}`;
+  }
+  return `${gpu.powerDrawW.toFixed(0)} W / limit n/a`;
+}
+
 function HostMetricTile({
   icon: Icon,
   label,
@@ -3939,6 +4002,38 @@ function HostMetricTile({
   );
 }
 
+function HostMemoryPanel({ host }: { host: Host }) {
+  const t = useT();
+  const language = useContext(I18nContext);
+  const rows = memoryBreakdownRows(host);
+  return (
+    <div className="host-memory-panel">
+      <div className="host-memory-head">
+        <PanelTitle icon={MemoryStick} title={t("memoryBreakdown")} />
+        <span>{host.memoryTotalGb > 0 ? `${host.memoryUsedGb} / ${host.memoryTotalGb} GB` : t("notConnected")}</span>
+      </div>
+      <p>{t("memoryBreakdownHint")}</p>
+      {rows.length ? (
+        <div className="memory-breakdown-list">
+          {rows.map((row) => (
+            <div key={row.key} className="memory-breakdown-row" title={memoryBreakdownNote(row, language)}>
+              <div className="memory-breakdown-label">
+                <strong>{memoryBreakdownLabel(row, language)}</strong>
+                <span>{row.valueGb.toFixed(2)} GB · {row.percent.toFixed(1)}%</span>
+              </div>
+              <div className="memory-breakdown-bar">
+                <span style={{ width: `${Math.max(2, Math.min(100, row.percent))}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="memory-breakdown-empty">{t("memoryBreakdownUnavailable")}</div>
+      )}
+    </div>
+  );
+}
+
 function HostGpuPanel({ host }: { host: Host }) {
   const t = useT();
   if (!host.gpus?.length) {
@@ -3951,41 +4046,54 @@ function HostGpuPanel({ host }: { host: Host }) {
   }
   return (
     <div className="host-gpu-panel">
-      {host.gpus.map((gpu) => (
-        <div key={`${host.id}-gpu-${gpu.index}`} className="host-gpu-row">
-          <div className="host-gpu-main">
-            <span>GPU {gpu.index}</span>
-            <strong>{gpu.name}</strong>
-            {gpu.uuid && <small>{shortGpuUuid(gpu.uuid)}</small>}
-          </div>
-          <Readout label={t("memoryLabel")} value={`${gbFromMiB(gpu.memoryUsedMiB)} / ${gbFromMiB(gpu.memoryTotalMiB)} GB`} />
-          <Readout label={t("gpuUtil")} value={`${gpu.utilization}%`} />
-          <Readout label={t("power")} value={`${gpu.powerDrawW} / ${gpu.powerLimitW} W`} />
-          <Readout label={t("temperature")} value={`${gpu.temperatureC} C`} />
-          <div className="gpu-process-table">
-            <div className="gpu-process-head">
-              <span>PID</span>
-              <span>{t("processLabel")}</span>
-              <span>{t("gpuMemShort")}</span>
-              <span>{t("runLabel")}</span>
+      {host.gpus.map((gpu) => {
+        const allProcesses = gpu.processes ?? [];
+        const visibleProcesses = importantGpuProcesses(allProcesses);
+        const hiddenCount = Math.max(0, allProcesses.length - visibleProcesses.length);
+        return (
+          <div key={`${host.id}-gpu-${gpu.index}`} className="host-gpu-row">
+            <div className="host-gpu-main">
+              <span>GPU {gpu.index}</span>
+              <strong>{gpu.name}</strong>
+              {gpu.uuid && <small>{shortGpuUuid(gpu.uuid)}</small>}
             </div>
-            {gpu.processes?.length ? gpu.processes.map((process) => (
-              <div
-                key={`${gpu.index}-${process.pid}-${process.usedMemoryMiB}`}
-                className={process.role === "notebook" ? "gpu-process-row notebook" : "gpu-process-row"}
-                title={process.command || process.name}
-              >
-                <span>{process.pid}</span>
-                <strong>{process.name || t("processLabel")}</strong>
-                <span>{gbFromMiB(process.usedMemoryMiB)} GB</span>
-                <em>{formatGpuProcessOwner(process)}</em>
+            <Readout label={t("memoryLabel")} value={`${gbFromMiB(gpu.memoryUsedMiB)} / ${gbFromMiB(gpu.memoryTotalMiB)} GB`} />
+            <Readout label={t("gpuUtil")} value={`${gpu.utilization}%`} />
+            <Readout label={t("power")} value={formatGpuPower(gpu)} />
+            <Readout label={t("temperature")} value={`${gpu.temperatureC} C`} />
+            <div className="gpu-process-table">
+              <div className="gpu-process-summary">
+                <strong>{t("language") === "语言" ? "重点 GPU 进程" : "Key GPU processes"}</strong>
+                <span>
+                  {hiddenCount > 0
+                    ? (t("language") === "语言" ? `已隐藏 ${hiddenCount} 个低显存进程` : `${hiddenCount} low-memory processes hidden`)
+                    : (t("language") === "语言" ? "按显存占用排序" : "Sorted by GPU memory")}
+                </span>
               </div>
-            )) : (
-              <div className="gpu-process-empty">{t("noGpuProcesses")}</div>
-            )}
+              <div className="gpu-process-head">
+                <span>PID</span>
+                <span>{t("processLabel")}</span>
+                <span>{t("gpuMemShort")}</span>
+                <span>{t("runLabel")}</span>
+              </div>
+              {visibleProcesses.length ? visibleProcesses.map((process) => (
+                <div
+                  key={`${gpu.index}-${process.pid}-${process.usedMemoryMiB}`}
+                  className={process.role === "notebook" ? "gpu-process-row notebook" : "gpu-process-row"}
+                  title={process.command || process.name}
+                >
+                  <span>{process.pid}</span>
+                  <strong>{process.name || t("processLabel")}</strong>
+                  <span>{gbFromMiB(process.usedMemoryMiB)} GB</span>
+                  <em>{formatGpuProcessOwner(process)}</em>
+                </div>
+              )) : (
+                <div className="gpu-process-empty">{t("noGpuProcesses")}</div>
+              )}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -4295,8 +4403,8 @@ function ResourceOverview({ host }: { host?: Host }) {
                 <Meter label={t("gpuUtil")} value={gpu.utilization} detail={`${gpu.utilization.toFixed(0)}%`} accent="cyan" />
                 <Meter
                   label={t("power")}
-                  value={gpu.powerLimitW ? (gpu.powerDrawW / gpu.powerLimitW) * 100 : 0}
-                  detail={`${gpu.powerDrawW.toFixed(0)} / ${gpu.powerLimitW.toFixed(0)} W`}
+                  value={gpuPowerPercent(gpu)}
+                  detail={formatGpuPowerDetail(gpu)}
                   accent="amber"
                 />
                 <div className="temp-pill">{gpu.temperatureC.toFixed(0)}°C</div>
@@ -4638,6 +4746,103 @@ function avg(values: number[]) {
 
 function memoryUsagePercent(host: Host) {
   return host.memoryTotalGb > 0 ? Math.round((host.memoryUsedGb / host.memoryTotalGb) * 100) : 0;
+}
+
+function memoryBreakdownRows(host: Host): MemoryBreakdown[] {
+  if (host.memoryBreakdown?.length) {
+    return host.memoryBreakdown
+      .filter((row) => Number.isFinite(row.valueGb) && row.valueGb > 0)
+      .map((row) => ({
+        ...row,
+        percent: Number.isFinite(row.percent) ? row.percent : host.memoryTotalGb ? (row.valueGb / host.memoryTotalGb) * 100 : 0
+      }))
+      .sort((left, right) => memoryBreakdownRank(left.key) - memoryBreakdownRank(right.key));
+  }
+  if (host.memoryTotalGb <= 0) {
+    return [];
+  }
+  const usedPercent = (host.memoryUsedGb / host.memoryTotalGb) * 100;
+  const availableGb = Math.max(0, host.memoryTotalGb - host.memoryUsedGb);
+  return [
+    { key: "used", label: "Used", valueGb: host.memoryUsedGb, percent: usedPercent },
+    { key: "available", label: "Available", valueGb: availableGb, percent: 100 - usedPercent }
+  ].filter((row) => row.valueGb > 0);
+}
+
+function memoryBreakdownRank(key: string) {
+  const order = [
+    "windows_used",
+    "windows_available",
+    "windows_cache",
+    "windows_committed",
+    "windows_free",
+    "linux_used",
+    "linux_buffers",
+    "linux_cache",
+    "linux_shared",
+    "linux_available",
+    "macos_wired",
+    "macos_active",
+    "macos_inactive",
+    "macos_compressed",
+    "macos_free",
+    "used",
+    "available",
+    "free"
+  ];
+  const index = order.indexOf(key);
+  return index >= 0 ? index : order.length;
+}
+
+function memoryBreakdownLabel(row: MemoryBreakdown, language: Language) {
+  if (language === "en") {
+    return row.label || row.key;
+  }
+  const labels: Record<string, string> = {
+    windows_used: "使用中",
+    windows_available: "可用",
+    windows_cache: "系统缓存",
+    windows_committed: "已提交",
+    windows_free: "空闲",
+    linux_used: "使用中",
+    linux_buffers: "Buffers",
+    linux_cache: "Cache",
+    linux_shared: "Shared",
+    linux_available: "可用估算",
+    macos_wired: "Wired",
+    macos_active: "Active",
+    macos_inactive: "Inactive",
+    macos_compressed: "Compressed",
+    macos_free: "Free",
+    used: "使用中",
+    available: "可用",
+    free: "空闲"
+  };
+  return labels[row.key] ?? row.label ?? row.key;
+}
+
+function memoryBreakdownNote(row: MemoryBreakdown, language: Language) {
+  if (language === "en") {
+    return row.note || row.label || row.key;
+  }
+  const notes: Record<string, string> = {
+    windows_used: "Windows：正在使用的物理内存",
+    windows_available: "Windows：无需换页即可立即分配的内存",
+    windows_cache: "Windows：系统文件缓存",
+    windows_committed: "Windows：已提交虚拟内存，可能大于物理内存",
+    windows_free: "Windows：完全未使用的页面",
+    linux_used: "Linux：通常按 MemTotal - MemAvailable 估算",
+    linux_buffers: "Linux：块设备缓冲",
+    linux_cache: "Linux：文件缓存和可回收 slab",
+    linux_shared: "Linux：tmpfs / shared memory",
+    linux_available: "Linux：内核估算的新进程可用内存",
+    macos_wired: "macOS：不能换出的内存",
+    macos_active: "macOS：最近使用的应用内存",
+    macos_inactive: "macOS：可回收的 inactive 内存",
+    macos_compressed: "macOS：内核压缩内存",
+    macos_free: "macOS：空闲页面"
+  };
+  return notes[row.key] ?? row.note ?? row.label ?? row.key;
 }
 
 function averageGpuUtilPercent(host: Host) {

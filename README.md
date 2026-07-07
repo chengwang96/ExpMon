@@ -120,7 +120,17 @@ Useful environment variables:
 
 ## Host / SSH
 
-The **Host / SSH** page shows local host resources and stores remote SSH server profiles in a gitignored local file. Key-based SSH profiles can be tested from the UI with the local `ssh` command and can fetch an on-demand remote resource snapshot. Password profiles are saved locally as requested, but non-interactive connection testing and remote snapshots require `sshpass` or switching the profile to key-based authentication.
+The **Host / SSH** page shows local host resources and stores remote SSH server profiles in a gitignored local file. Key-based SSH profiles can be tested from the UI with the local `ssh` command.
+
+For stable remote monitoring on Windows, macOS, or Ubuntu, run the lightweight remote agent on the target machine:
+
+```powershell
+python scripts/remote_agent.py --host 0.0.0.0 --port 5194
+```
+
+The local collector first tries `http://<ssh-host>:5194/api/host` and falls back to one-shot SSH sampling when the agent is not reachable. Use `EXPMON_REMOTE_AGENT_PORT` on the local collector if you choose a different port. For a shared network, set `EXPMON_AGENT_TOKEN` on the remote agent and the same value as `EXPMON_REMOTE_AGENT_TOKEN` on the local collector.
+
+Password SSH profiles are saved locally as requested, but non-interactive connection testing and one-shot SSH snapshots require `sshpass` or switching the profile to key-based authentication.
 
 ## Project Workspace
 
