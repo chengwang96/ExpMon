@@ -27,12 +27,44 @@ def main() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1500, "height": 1000})
-        page.add_init_script("window.localStorage.setItem('expmon-language', 'en')")
+        page.add_init_script(
+            """
+            window.localStorage.setItem('expmon-language', 'en');
+            Object.keys(window.localStorage)
+              .filter((key) => key.startsWith('expmon.order.'))
+              .forEach((key) => window.localStorage.removeItem(key));
+            ['mousedown', 'mousemove', 'mouseover', 'mouseup'].forEach((name) => {
+              document.addEventListener(name, () => undefined);
+            });
+            """
+        )
         page.goto(frontend_url, wait_until="networkidle")
 
         expect(page.get_by_role("heading", name="Resource Dashboard")).to_be_visible()
         expect(page.locator("nav.nav-list").get_by_role("button", name="Run Detail")).to_have_count(0)
         note("PASS: default English dashboard and sidebar shape")
+
+        host_cards = page.locator(".dashboard-host-grid [data-draggable-card='true']")
+        if host_cards.count() >= 2:
+            page.wait_for_timeout(500)
+            host_cards.nth(0).scroll_into_view_if_needed()
+            first_host_id = host_cards.nth(0).get_attribute("data-draggable-card-id")
+            first_box = host_cards.nth(0).bounding_box()
+            second_box = host_cards.nth(1).bounding_box()
+            if first_box is None or second_box is None or first_host_id is None:
+                raise AssertionError("dashboard host cards were not measurable for drag test")
+            page.mouse.move(first_box["x"] + first_box["width"] / 2, first_box["y"] + first_box["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(second_box["x"] + second_box["width"] / 2, second_box["y"] + second_box["height"] / 2, steps=12)
+            page.mouse.up()
+            expect(host_cards.nth(1)).to_have_attribute("data-draggable-card-id", first_host_id)
+            page.reload(wait_until="networkidle")
+            page.wait_for_timeout(500)
+            page.locator(".dashboard-host-grid [data-draggable-card='true']").nth(0).scroll_into_view_if_needed()
+            expect(page.locator(".dashboard-host-grid [data-draggable-card='true']").nth(1)).to_have_attribute("data-draggable-card-id", first_host_id)
+            note("PASS: dashboard cards drag reorder and persist")
+        else:
+            note("SKIP: dashboard card drag reorder, fewer than two host cards")
 
         refresh_button = page.get_by_role("button", name="Refresh")
         refresh_button.click()

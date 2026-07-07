@@ -36,7 +36,16 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent
+} from "react";
 
 type ResourceType = "cpu_only" | "gpu" | "hybrid" | "unknown";
 type RunStatus = "running" | "finished" | "failed" | "killed" | "unmanaged";
@@ -1614,6 +1623,233 @@ function viewTitle(view: NavKey, t: (key: TextKey) => string) {
   }
 }
 
+type DraggableCardProps = {
+  draggable: false;
+  "data-draggable-card": "true";
+  "data-draggable-card-id": string;
+  "data-draggable-card-group": string;
+  "data-dragging"?: "true";
+  "data-drag-over"?: "true";
+  onClickCapture: (event: MouseEvent<HTMLElement>) => void;
+};
+
+function readStoredOrder(storageKey: string) {
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function sameStringArray(left: string[], right: string[]) {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function usePersistentCardOrder<T>(
+  storageKey: string,
+  items: T[],
+  getId: (item: T) => string
+) {
+  const itemIds = useMemo(() => items.map(getId), [getId, items]);
+  const itemIdsKey = itemIds.join("|");
+  const [orderedIds, setOrderedIds] = useState<string[]>(() => readStoredOrder(storageKey));
+  const [draggingId, setDraggingId] = useState("");
+  const [dragOverId, setDragOverId] = useState("");
+  const suppressNextClickRef = useRef(false);
+  const dragSourceIdRef = useRef("");
+  const lastReorderTargetRef = useRef("");
+
+  const clearDragState = useCallback(() => {
+    setDragOverId("");
+    setDraggingId("");
+    dragSourceIdRef.current = "";
+    lastReorderTargetRef.current = "";
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("pointerup", clearDragState);
+    window.addEventListener("pointercancel", clearDragState);
+    window.addEventListener("mouseup", clearDragState);
+    return () => {
+      window.removeEventListener("pointerup", clearDragState);
+      window.removeEventListener("pointercancel", clearDragState);
+      window.removeEventListener("mouseup", clearDragState);
+    };
+  }, [clearDragState]);
+
+  useEffect(() => {
+    setOrderedIds((current) => {
+      const known = current.filter((id) => itemIds.includes(id));
+      const appended = itemIds.filter((id) => !known.includes(id));
+      const next = [...known, ...appended];
+      return sameStringArray(current, next) ? current : next;
+    });
+  }, [itemIdsKey]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(orderedIds));
+    } catch {
+      // localStorage can be unavailable in restricted browser modes.
+    }
+  }, [orderedIds, storageKey]);
+
+  const orderedItems = useMemo(() => {
+    const rank = new Map(orderedIds.map((id, index) => [id, index]));
+    return [...items].sort((left, right) => {
+      const leftRank = rank.get(getId(left)) ?? Number.MAX_SAFE_INTEGER;
+      const rightRank = rank.get(getId(right)) ?? Number.MAX_SAFE_INTEGER;
+      return leftRank - rightRank;
+    });
+  }, [getId, items, orderedIds]);
+
+  const moveCard = useCallback((sourceId: string, targetId: string) => {
+    if (!sourceId || sourceId === targetId) {
+      return;
+    }
+    setOrderedIds((current) => {
+      const known = current.filter((item) => itemIds.includes(item));
+      const base = [...known, ...itemIds.filter((item) => !known.includes(item))];
+      const sourceIndex = base.indexOf(sourceId);
+      const targetIndex = base.indexOf(targetId);
+      if (sourceIndex < 0 || targetIndex < 0) {
+        return current;
+      }
+      const next = [...base];
+      const [moved] = next.splice(sourceIndex, 1);
+      next.splice(targetIndex, 0, moved);
+      suppressNextClickRef.current = true;
+      return next;
+    });
+  }, [itemIds]);
+
+  const findCardElementAtPoint = useCallback((clientX: number, clientY: number) => {
+    for (const element of document.elementsFromPoint(clientX, clientY)) {
+      if (!(element instanceof HTMLElement)) {
+        continue;
+      }
+      const card = element.closest<HTMLElement>("[data-draggable-card-id]");
+      const targetId = card?.dataset.draggableCardId;
+      if (
+        targetId
+        && itemIds.includes(targetId)
+        && card?.dataset.draggableCardGroup === storageKey
+      ) {
+        return card;
+      }
+    }
+    return null;
+  }, [itemIds, storageKey]);
+
+  const findCardIdAtPoint = useCallback((clientX: number, clientY: number) => {
+    return findCardElementAtPoint(clientX, clientY)?.dataset.draggableCardId ?? "";
+  }, [findCardElementAtPoint]);
+
+  const shouldIgnoreGlobalDragStart = useCallback((event: globalThis.MouseEvent | globalThis.PointerEvent, card: HTMLElement) => {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const interactive = target?.closest("button, input, select, textarea, a");
+    return Boolean(interactive && interactive !== card);
+  }, []);
+
+  const startCardDrag = useCallback((id: string) => {
+    dragSourceIdRef.current = id;
+    lastReorderTargetRef.current = "";
+    setDraggingId(id);
+  }, []);
+
+  const handleGlobalPointerDown = useCallback((event: globalThis.PointerEvent) => {
+    if (event.button !== 0) {
+      return;
+    }
+    const card = findCardElementAtPoint(event.clientX, event.clientY);
+    const id = card?.dataset.draggableCardId;
+    if (!card || !id || shouldIgnoreGlobalDragStart(event, card)) {
+      return;
+    }
+    startCardDrag(id);
+  }, [findCardElementAtPoint, shouldIgnoreGlobalDragStart, startCardDrag]);
+
+  const handleGlobalMouseDown = useCallback((event: globalThis.MouseEvent) => {
+    if (event.button !== 0) {
+      return;
+    }
+    const card = findCardElementAtPoint(event.clientX, event.clientY);
+    const id = card?.dataset.draggableCardId;
+    if (!card || !id || shouldIgnoreGlobalDragStart(event, card)) {
+      return;
+    }
+    startCardDrag(id);
+  }, [findCardElementAtPoint, shouldIgnoreGlobalDragStart, startCardDrag]);
+
+  useEffect(() => {
+    window.addEventListener("pointerdown", handleGlobalPointerDown);
+    window.addEventListener("mousedown", handleGlobalMouseDown);
+    return () => {
+      window.removeEventListener("pointerdown", handleGlobalPointerDown);
+      window.removeEventListener("mousedown", handleGlobalMouseDown);
+    };
+  }, [handleGlobalMouseDown, handleGlobalPointerDown]);
+
+  const handlePointerMove = useCallback((event: globalThis.PointerEvent) => {
+    const sourceId = dragSourceIdRef.current;
+    if (!sourceId) {
+      return;
+    }
+    const targetId = findCardIdAtPoint(event.clientX, event.clientY);
+    if (!targetId || targetId === sourceId || lastReorderTargetRef.current === targetId) {
+      return;
+    }
+    lastReorderTargetRef.current = targetId;
+    setDragOverId(targetId);
+    moveCard(sourceId, targetId);
+  }, [findCardIdAtPoint, moveCard]);
+
+  useEffect(() => {
+    window.addEventListener("pointermove", handlePointerMove);
+    return () => window.removeEventListener("pointermove", handlePointerMove);
+  }, [handlePointerMove]);
+
+  const handleMouseMove = useCallback((event: globalThis.MouseEvent) => {
+    const sourceId = dragSourceIdRef.current;
+    if (!sourceId) {
+      return;
+    }
+    const targetId = findCardIdAtPoint(event.clientX, event.clientY);
+    if (!targetId || targetId === sourceId || lastReorderTargetRef.current === targetId) {
+      return;
+    }
+    lastReorderTargetRef.current = targetId;
+    setDragOverId(targetId);
+    moveCard(sourceId, targetId);
+  }, [findCardIdAtPoint, moveCard]);
+
+  useEffect(() => {
+    window.addEventListener("mousemove", handleMouseMove);
+    return () => window.removeEventListener("mousemove", handleMouseMove);
+  }, [handleMouseMove]);
+
+  const dragPropsFor = useCallback((id: string): DraggableCardProps => ({
+    draggable: false,
+    "data-draggable-card": "true",
+    "data-draggable-card-id": id,
+    "data-draggable-card-group": storageKey,
+    "data-dragging": draggingId === id ? "true" : undefined,
+    "data-drag-over": dragOverId === id ? "true" : undefined,
+    onClickCapture: (event) => {
+      if (!suppressNextClickRef.current) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      suppressNextClickRef.current = false;
+    },
+  }), [dragOverId, draggingId, storageKey]);
+
+  return { orderedItems, dragPropsFor };
+}
+
 function Dashboard({
   hosts,
   runs,
@@ -1648,7 +1884,24 @@ function Dashboard({
     };
   }, [hosts, runs]);
 
-  const activeRuns = runs.filter((run) => run.status === "running");
+  const activeRuns = useMemo(() => runs.filter((run) => run.status === "running"), [runs]);
+  const hostOrderId = useCallback((host: Host) => host.id, []);
+  const runOrderId = useCallback((run: Run) => run.id, []);
+  const { orderedItems: orderedHostMix, dragPropsFor: hostMixDragProps } = usePersistentCardOrder(
+    "expmon.order.dashboard.hostMix",
+    hosts,
+    hostOrderId
+  );
+  const { orderedItems: orderedDashboardHosts, dragPropsFor: dashboardHostDragProps } = usePersistentCardOrder(
+    "expmon.order.dashboard.hosts",
+    hosts,
+    hostOrderId
+  );
+  const { orderedItems: orderedActiveRuns, dragPropsFor: activeRunDragProps } = usePersistentCardOrder(
+    "expmon.order.dashboard.activeRuns",
+    activeRuns,
+    runOrderId
+  );
 
   return (
     <section className="view-stack">
@@ -1669,8 +1922,8 @@ function Dashboard({
         <div className="panel host-mix-panel">
           <PanelTitle icon={BarChart3} title={t("hostResourceMix")} />
           <div className="host-mix-list">
-            {hosts.map((host) => (
-              <button key={host.id} className="host-mix-card" onClick={() => onOpenHost(host.id)}>
+            {orderedHostMix.map((host) => (
+              <button key={host.id} className="host-mix-card" onClick={() => onOpenHost(host.id)} {...hostMixDragProps(host.id)}>
                 <div className="host-mix-head">
                   <strong>{displayHostName(host, t)}</strong>
                   <span>{host.runningRuns} {t("runningSuffix")}</span>
@@ -1694,8 +1947,8 @@ function Dashboard({
         <div className="panel dashboard-host-panel">
           <PanelTitle icon={Server} title={t("hosts")} />
           <div className="dashboard-host-grid">
-            {hosts.map((host) => (
-              <button key={host.id} className="host-tile" onClick={() => onOpenHost(host.id)}>
+            {orderedDashboardHosts.map((host) => (
+              <button key={host.id} className="host-tile" onClick={() => onOpenHost(host.id)} {...dashboardHostDragProps(host.id)}>
                 <div className="host-tile-top">
                   <span>{displayHostName(host, t)}</span>
                   {host.warnings.length ? <AlertTriangle size={16} /> : <Activity size={16} />}
@@ -1717,8 +1970,8 @@ function Dashboard({
         <div className="panel run-queue">
           <PanelTitle icon={Workflow} title={t("activeRuns")} />
           <div className="run-stack">
-            {activeRuns.length ? activeRuns.map((run) => (
-              <button key={run.id} className="run-strip" onClick={() => onOpenRun(run.id)}>
+            {orderedActiveRuns.length ? orderedActiveRuns.map((run) => (
+              <button key={run.id} className="run-strip" onClick={() => onOpenRun(run.id)} {...activeRunDragProps(run.id)}>
                 <span className={`status-dot ${run.status}`} />
                 <span>
                   <strong>{run.project}</strong>
@@ -2524,6 +2777,12 @@ function ProjectsView({
   const [commitBody, setCommitBody] = useState("");
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? projects[0];
   const hostNameById = useMemo(() => new Map(hosts.map((host) => [host.id, displayHostName(host, (key) => translate(language, key))])), [hosts, language]);
+  const projectOrderId = useCallback((project: Project) => project.id, []);
+  const { orderedItems: orderedProjects, dragPropsFor: projectDragProps } = usePersistentCardOrder(
+    "expmon.order.projects.selector",
+    projects,
+    projectOrderId
+  );
 
   useEffect(() => {
     if (!projects.length) {
@@ -2729,11 +2988,12 @@ function ProjectsView({
       <div className="project-list panel">
         <PanelTitle icon={Layers3} title={labels.selectProject} />
         <div className="project-selector-list">
-          {projects.map((project) => (
+          {orderedProjects.map((project) => (
             <button
               key={project.id}
               className={project.id === selectedProject?.id ? "project-selector active" : "project-selector"}
               onClick={() => setSelectedProjectId(project.id)}
+              {...projectDragProps(project.id)}
             >
               <strong>{project.name}</strong>
               <span>{project.path}</span>
@@ -3467,17 +3727,24 @@ function DiagnosticList({
   onOpenRun: (runId: string) => void;
 }) {
   const t = useT();
+  const diagnosticOrderId = useCallback((item: Diagnostic) => item.id, []);
+  const { orderedItems: orderedDiagnostics, dragPropsFor: diagnosticDragProps } = usePersistentCardOrder(
+    "expmon.order.dashboard.diagnostics",
+    diagnostics,
+    diagnosticOrderId
+  );
   if (!diagnostics.length) {
     return <EmptyPanel title={t("noInsights")} body={t("noInsightsBody")} />;
   }
   return (
     <div className="diagnostic-list">
-      {diagnostics.map((item) => (
+      {orderedDiagnostics.map((item) => (
         <button
           key={item.id}
           className={`diagnostic-row ${item.severity}`}
           onClick={() => item.runId && onOpenRun(item.runId)}
           disabled={!item.runId}
+          {...diagnosticDragProps(item.id)}
         >
           <strong>{diagnosticTitle(item, t)}</strong>
           <span>{diagnosticMessage(item, t)}</span>
@@ -3639,6 +3906,12 @@ function SshServerPanel({
   const t = useT();
   const [testingId, setTestingId] = useState("");
   const [testResults, setTestResults] = useState<Record<string, SshTestResult>>({});
+  const serverOrderId = useCallback((server: SshServer) => server.id, []);
+  const { orderedItems: orderedServers, dragPropsFor: serverDragProps } = usePersistentCardOrder(
+    "expmon.order.ssh.servers",
+    servers,
+    serverOrderId
+  );
   const runServerTest = useCallback((server: SshServer) => {
     setTestingId(server.id);
     setTestResults((current) => ({
@@ -3674,8 +3947,8 @@ function SshServerPanel({
 
   return (
     <div className="ssh-server-stack">
-      {servers.map((server) => (
-        <div key={server.id} className="ssh-server-card">
+      {orderedServers.map((server) => (
+        <div key={server.id} className="ssh-server-card" {...serverDragProps(server.id)}>
           <div className="ssh-server-card-top">
             <div>
               <strong>{server.name}</strong>

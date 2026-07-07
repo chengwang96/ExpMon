@@ -924,6 +924,38 @@ h3 {
   background: rgba(19, 138, 126, 0.1);
 }
 
+[data-draggable-card="true"] {
+  cursor: grab;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    opacity 150ms ease,
+    transform 150ms ease;
+}
+
+[data-draggable-card="true"]:active {
+  cursor: grabbing;
+}
+
+[data-draggable-card="true"][data-dragging="true"] {
+  opacity: 0.62;
+  transform: scale(0.985);
+}
+
+[data-draggable-card="true"][data-drag-over="true"] {
+  border-color: rgba(19, 138, 126, 0.62);
+  background: #eefaf8;
+  box-shadow: inset 0 0 0 1px rgba(19, 138, 126, 0.16), 0 8px 18px rgba(15, 23, 42, 0.07);
+}
+
+[data-draggable-card="true"] button,
+[data-draggable-card="true"] input,
+[data-draggable-card="true"] select,
+[data-draggable-card="true"] textarea {
+  cursor: auto;
+}
+
 .run-stack {
   display: grid;
   gap: 10px;
