@@ -1,4 +1,4 @@
-# ExpMon
+# ExpMon - 本地优先的实验任务、GPU 与 SSH 主机监控
 
 [English README](README.md)
 
