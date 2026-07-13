@@ -38,6 +38,23 @@ Level C cannot reliably show:
 - stdout/stderr history after collector restarts
 - stable run identity after process exit
 
+## Level B: adopt an existing process
+
+Use `adopt` when a training process was started outside ExpMon and must keep running:
+
+```bash
+python scripts/expmon.py adopt \
+  --pid 3637117 \
+  --project NeuroSTORM \
+  --name hcp1200-h200-gpu0 \
+  --resource-type gpu \
+  --log-file nohup.out
+```
+
+Adoption creates a stable run id, manifest, process identity, and resource history without restarting the process. The collector infers the original start time, command, working directory, user, and process tree. `--log-file` is optional and lets the run page tail an existing `nohup` log.
+
+An adopted run is Level B rather than Level A: ExpMon cannot reconstruct output emitted before adoption, inject `EXPMON_*` environment variables into an existing process, or recover an exit code it does not supervise. New metrics can still be appended with `expmon log --run-dir <printed-run-dir> ...`.
+
 ## Level A: managed run
 
 Use `scripts/expmon.py launch` to start the task.

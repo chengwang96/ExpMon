@@ -188,6 +188,8 @@ type SshSaveResult = {
 type SshTestResult = {
   ok: boolean;
   supported?: boolean;
+  initializing?: boolean;
+  refreshInProgress?: boolean;
   testedAt?: string;
   sampledAt?: string;
   latencyMs?: number;
@@ -291,6 +293,11 @@ type Project = {
   totalGpuHours?: number;
   avgGpuUtil?: number;
   lastActivity: string;
+};
+
+type UserOption = {
+  value: string;
+  count: number;
 };
 
 type Diagnostic = {
@@ -397,6 +404,7 @@ const timeline = ["15:31", "15:36", "15:41", "15:46", "15:51", "15:56", "16:01",
 const initialRuns: Run[] = [];
 
 const REFRESH_INTERVAL_MS = 3000;
+const ALL_USERS = "__expmon_all_users__";
 const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env ?? {};
 const API_BASE = (VITE_ENV.VITE_COLLECTOR_URL ?? "http://127.0.0.1:5184").replace(/\/$/, "");
 
@@ -437,6 +445,7 @@ const TEXT = {
     host: "主机",
     rootPid: "Root PID",
     userLabel: "用户",
+    allUsers: "全部用户",
     runtimeLabel: "运行时长",
     cpuTreeLabel: "CPU 根进程/进程树",
     accessLevelLabel: "级别",
@@ -654,6 +663,7 @@ const TEXT = {
     host: "Host",
     rootPid: "Root PID",
     userLabel: "User",
+    allUsers: "All users",
     runtimeLabel: "Runtime",
     cpuTreeLabel: "CPU root/tree",
     accessLevelLabel: "Level",
@@ -869,6 +879,7 @@ function App() {
   const [selectedHostId, setSelectedHostId] = useState(initialHosts[0].id);
   const [query, setQuery] = useState("");
   const [resourceFilter, setResourceFilter] = useState<ResourceType | "all">("all");
+  const [userFilter, setUserFilter] = useState(ALL_USERS);
   const [lastRefreshAt, setLastRefreshAt] = useState(() => new Date());
   const [manualRefreshInFlight, setManualRefreshInFlight] = useState(false);
   const [operationMessage, setOperationMessage] = useState("");
@@ -1290,7 +1301,7 @@ function App() {
     }
   }, [updateRemoteHosts]);
 
-  const refreshSshServerResources = useCallback((server: SshServer, markInitializing = false) => {
+  const refreshSshServerResources = useCallback((server: SshServer, markInitializing = false, background = false) => {
     if (sshResourceInFlightRef.current.has(server.id)) {
       return;
     }
@@ -1298,7 +1309,8 @@ function App() {
     if (markInitializing) {
       handleRemoteHostRefresh(hostFromSshServer(server, undefined, "initializing"), false);
     }
-    fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/resources`, {
+    const backgroundQuery = background ? "?background=1" : "";
+    fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/resources${backgroundQuery}`, {
       method: "POST"
     })
       .then(async (response) => {
@@ -1311,6 +1323,8 @@ function App() {
       .then((payload) => {
         if (payload.ok && payload.host) {
           handleRemoteHostRefresh(payload.host, false);
+        } else if (payload.initializing || payload.refreshInProgress) {
+          handleRemoteHostRefresh(hostFromSshServer(server, payload, "initializing"), false, true);
         } else {
           handleRemoteHostRefresh(hostFromSshServer(server, payload, "failed"), false, true);
         }
@@ -1335,14 +1349,14 @@ function App() {
     servers.forEach((server) => {
       if (!sshAutoStartedRef.current.has(server.id)) {
         sshAutoStartedRef.current.add(server.id);
-        refreshSshServerResources(server, true);
+        refreshSshServerResources(server, true, true);
       }
     });
   }, [refreshSshServerResources, snapshot.sshServers]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      sshServersRef.current.forEach((server) => refreshSshServerResources(server, false));
+      sshServersRef.current.forEach((server) => refreshSshServerResources(server, false, true));
     }, REFRESH_INTERVAL_MS);
     return () => window.clearInterval(timer);
   }, [refreshSshServerResources]);
@@ -1384,8 +1398,18 @@ function App() {
   }, [hosts, runs, selectedHostId, selectedRunId]);
   const selectedRun = runs.find((run) => run.id === selectedRunId);
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? hosts[0];
+  const userOptions = useMemo(() => userOptionsFromRuns(runs), [runs]);
+  useEffect(() => {
+    if (userFilter !== ALL_USERS && !userOptions.some((option) => option.value === userFilter)) {
+      setUserFilter(ALL_USERS);
+    }
+  }, [userFilter, userOptions]);
+  const userFilteredRuns = useMemo(
+    () => runs.filter((run) => userFilter === ALL_USERS || normalizedRunUser(run) === userFilter),
+    [runs, userFilter]
+  );
   const filteredRuns = useMemo(() => {
-    return runs.filter((run) => {
+    return userFilteredRuns.filter((run) => {
       const host = hosts.find((item) => item.id === run.hostId);
       const text = [run.project, run.name, run.command, host?.name, run.tags.join(" ")]
         .join(" ")
@@ -1394,7 +1418,15 @@ function App() {
       const matchesResource = resourceFilter === "all" || run.resourceType === resourceFilter;
       return matchesQuery && matchesResource;
     });
-  }, [hosts, query, resourceFilter, runs]);
+  }, [hosts, query, resourceFilter, userFilteredRuns]);
+  const userFilteredProjects = useMemo(
+    () => projectsForUser(snapshot.projects ?? [], runs, userFilter),
+    [runs, snapshot.projects, userFilter]
+  );
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }, [activeView, selectedHostId]);
 
   return (
     <I18nContext.Provider value={language}>
@@ -1513,6 +1545,9 @@ function App() {
             config={snapshot.config}
             resourceFilter={resourceFilter}
             onResourceFilter={setResourceFilter}
+            userFilter={userFilter}
+            userOptions={userOptions}
+            onUserFilter={setUserFilter}
             onOpenRun={(runId) => {
               setSelectedRunId(runId);
               setActiveView("detail");
@@ -1523,9 +1558,12 @@ function App() {
         )}
         {activeView === "projects" && (
           <ProjectsView
-            projects={snapshot.projects ?? []}
-            runs={runs}
+            projects={userFilteredProjects}
+            runs={userFilteredRuns}
             hosts={hosts}
+            userFilter={userFilter}
+            userOptions={userOptions}
+            onUserFilter={setUserFilter}
             onOpenRun={(runId) => {
               setSelectedRunId(runId);
               setActiveView("detail");
@@ -2521,12 +2559,25 @@ function HostsView({
         </div>
 
         <div className="panel host-core-panel">
-          <PanelTitle icon={Cpu} title={t("perCoreCpu")} />
-          <div className="core-grid">
+          <div className="panel-title-row core-panel-heading">
+            <PanelTitle icon={Cpu} title={t("perCoreCpu")} />
+            <span>{selectedHost.cores.length} {t("cores")}</span>
+          </div>
+          <div className="core-grid" aria-label={`${selectedHost.cores.length} ${t("cores")}`}>
             {selectedHost.cores.map((value, index) => (
-              <div key={`${selectedHost.id}-${index}`} className="core-cell">
-                <span style={{ height: `${Math.max(value, 8)}%` }} />
-                <small>{index}</small>
+              <div
+                key={`${selectedHost.id}-${index}`}
+                className="core-cell"
+                title={`Core ${index}: ${value}%`}
+                aria-label={`Core ${index}: ${value}%`}
+              >
+                <div className="core-cell-head">
+                  <small>#{index}</small>
+                  <strong>{value.toFixed(0)}%</strong>
+                </div>
+                <div className="core-meter">
+                  <span style={{ width: `${Math.max(value, 2)}%` }} />
+                </div>
               </div>
             ))}
           </div>
@@ -2598,12 +2649,88 @@ function HostsView({
   );
 }
 
+function normalizedRunUser(run: Run) {
+  return run.user.trim() || "(unknown)";
+}
+
+function userOptionsFromRuns(runs: Run[]): UserOption[] {
+  const counts = new Map<string, number>();
+  runs.forEach((run) => {
+    const user = normalizedRunUser(run);
+    counts.set(user, (counts.get(user) ?? 0) + 1);
+  });
+  return Array.from(counts, ([value, count]) => ({ value, count }))
+    .sort((left, right) => left.value.localeCompare(right.value, undefined, { numeric: true }));
+}
+
+function projectsForUser(projects: Project[], runs: Run[], userFilter: string): Project[] {
+  if (userFilter === ALL_USERS) {
+    return projects;
+  }
+  const runsById = new Map(
+    runs
+      .filter((run) => normalizedRunUser(run) === userFilter)
+      .map((run) => [run.id, run] as const)
+  );
+  return projects.flatMap((project) => {
+    const projectRuns = project.runs.map((runId) => runsById.get(runId)).filter((run): run is Run => Boolean(run));
+    if (!projectRuns.length) {
+      return [];
+    }
+    const gpuUtilValues = projectRuns
+      .map((run) => Number(run.summary?.avgGpuUtil ?? 0))
+      .filter((value) => value > 0);
+    return [{
+      ...project,
+      runs: projectRuns.map((run) => run.id),
+      runningRuns: projectRuns.filter((run) => run.status === "running").length,
+      finishedRuns: projectRuns.filter((run) => run.status !== "running").length,
+      failedRuns: projectRuns.filter((run) => run.status === "failed" || run.status === "killed").length,
+      totalGpuHours: Number(projectRuns.reduce((total, run) => total + Number(run.summary?.gpuHours ?? 0), 0).toFixed(3)),
+      avgGpuUtil: gpuUtilValues.length
+        ? Number((gpuUtilValues.reduce((total, value) => total + value, 0) / gpuUtilValues.length).toFixed(2))
+        : 0,
+      lastActivity: projectRuns.reduce(
+        (latest, run) => run.rootCreateTime > latest ? run.rootCreateTime : latest,
+        ""
+      )
+    }];
+  });
+}
+
+function UserFilterControl({
+  value,
+  options,
+  onChange
+}: {
+  value: string;
+  options: UserOption[];
+  onChange: (value: string) => void;
+}) {
+  const t = useT();
+  const total = options.reduce((sum, option) => sum + option.count, 0);
+  return (
+    <label className="user-filter">
+      <span>{t("userLabel")}</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)} aria-label={t("userLabel")}>
+        <option value={ALL_USERS}>{t("allUsers")} ({total})</option>
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>{option.value} ({option.count})</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function RunsView({
   runs,
   hosts,
   config,
   resourceFilter,
   onResourceFilter,
+  userFilter,
+  userOptions,
+  onUserFilter,
   onOpenRun,
   onDeleteRun,
   deleteInFlight
@@ -2613,6 +2740,9 @@ function RunsView({
   config?: CollectorConfig;
   resourceFilter: ResourceType | "all";
   onResourceFilter: (value: ResourceType | "all") => void;
+  userFilter: string;
+  userOptions: UserOption[];
+  onUserFilter: (value: string) => void;
   onOpenRun: (runId: string) => void;
   onDeleteRun: (run: Run) => void;
   deleteInFlight: string;
@@ -2633,10 +2763,13 @@ function RunsView({
             </button>
           ))}
         </div>
-        <button className={showRules ? "action-button active-action" : "action-button"} onClick={() => setShowRules((value) => !value)}>
-          <SlidersHorizontal size={16} />
-          {t("parserRules")}
-        </button>
+        <div className="runs-toolbar-actions">
+          <UserFilterControl value={userFilter} options={userOptions} onChange={onUserFilter} />
+          <button className={showRules ? "action-button active-action" : "action-button"} onClick={() => setShowRules((value) => !value)}>
+            <SlidersHorizontal size={16} />
+            {t("parserRules")}
+          </button>
+        </div>
       </div>
 
       {showRules && <ParserRulesPanel config={config} />}
@@ -2681,7 +2814,7 @@ function RunsView({
               <span><ResourceBadge type={run.resourceType} /></span>
               <span>
                 {host ? displayHostName(host, t) : run.hostId}
-                <small>{run.hostId}</small>
+                <small>{run.user} · {run.hostId}</small>
               </span>
               <span>{run.rootPid}</span>
               <span>{run.cpuPercent}%</span>
@@ -2892,12 +3025,18 @@ function ProjectsView({
   projects,
   runs,
   hosts,
+  userFilter,
+  userOptions,
+  onUserFilter,
   onOpenRun,
   requestConfirm
 }: {
   projects: Project[];
   runs: Run[];
   hosts: Host[];
+  userFilter: string;
+  userOptions: UserOption[];
+  onUserFilter: (value: string) => void;
   onOpenRun: (runId: string) => void;
   requestConfirm: (config: PendingConfirm) => void;
 }) {
@@ -3113,6 +3252,9 @@ function ProjectsView({
     return (
       <section className="view-stack">
         <div className="panel">
+          <div className="project-empty-filter">
+            <UserFilterControl value={userFilter} options={userOptions} onChange={onUserFilter} />
+          </div>
           <EmptyPanel title={labels.noProjects} body={labels.noProjectsBody} />
         </div>
       </section>
@@ -3123,6 +3265,9 @@ function ProjectsView({
     <section className="project-workspace">
       <div className="project-list panel">
         <PanelTitle icon={Layers3} title={labels.selectProject} />
+        <div className="project-user-filter">
+          <UserFilterControl value={userFilter} options={userOptions} onChange={onUserFilter} />
+        </div>
         <div className="project-selector-list">
           {orderedProjects.map((project) => (
             <button
@@ -3167,7 +3312,7 @@ function ProjectsView({
                 <StatusPill status={run.status} />
                 <span className="project-run-title">
                   <strong>{run.metadata?.pinned ? "★ " : ""}{run.project} / {run.name}</strong>
-                  <small>{runHostLabel(run)}</small>
+                  <small>{run.user} · {runHostLabel(run)}</small>
                   {run.metadata?.mark && <em className={`run-mark ${run.metadata.mark}`}>{run.metadata.mark}</em>}
                 </span>
                 <span>{run.rootPid}</span>

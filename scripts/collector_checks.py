@@ -1,12 +1,16 @@
+import argparse
+import os
 import tempfile
 from pathlib import Path
 
+import expmon
 import local_collector
 
 
 def main() -> None:
     original_config = local_collector.CONFIG
     original_ssh_path = local_collector.SSH_SERVERS_PATH
+    original_snapshot = local_collector.LATEST_SNAPSHOT
     try:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -97,6 +101,75 @@ def main() -> None:
             stale_run = local_collector.run_from_manifest(stale_run_dir, [])
             assert stale_run and stale_run["status"] == "finished", stale_run
 
+            adopted_logdir = workspace / "adopted-runs"
+            adopted_args = argparse.Namespace(
+                pid=os.getpid(),
+                project="AdoptedProject",
+                name="existing-training",
+                logdir=str(adopted_logdir),
+                cwd=str(run_cwd),
+                host_id="remote-host",
+                resource_type="gpu",
+                hparams=None,
+                tag=[],
+                command_text="python train.py",
+                log_file=None,
+            )
+            assert expmon.adopt(adopted_args) == 0
+            adopted_dirs = list((adopted_logdir / "AdoptedProject").iterdir())
+            assert len(adopted_dirs) == 1, adopted_dirs
+            adopted_manifest = local_collector.read_yaml(adopted_dirs[0] / "manifest.yaml")
+            adopted_status = local_collector.read_json(adopted_dirs[0] / "status.json")
+            assert adopted_manifest["process"]["root_pid"] == os.getpid(), adopted_manifest
+            assert adopted_manifest["process"]["adopted"] is True, adopted_manifest
+            assert adopted_status["launcher"] == "expmon-adopt", adopted_status
+            adopted_run = local_collector.run_from_manifest(adopted_dirs[0], [])
+            assert adopted_run and adopted_run["accessLevel"] == "B", adopted_run
+
+            remote_payload = local_collector.remote_host_payload(
+                "remote-1",
+                {"name": "H200", "host": "192.0.2.20", "username": "tester"},
+                {
+                    "host": {
+                        "hostname": "h200",
+                        "os": "Linux",
+                        "cpuUsage": 10,
+                        "memoryUsedGb": 8,
+                        "memoryTotalGb": 80,
+                    },
+                    "runs": [adopted_run],
+                },
+                sampled_at="2026-01-01T00:00:00",
+                latency_ms=1,
+                remote_os="linux",
+                source="agent-tunnel",
+            )
+            assert remote_payload["host"]["id"] == "ssh:remote-1", remote_payload
+            assert remote_payload["host"]["runningRuns"] == 1, remote_payload
+            assert remote_payload["runs"][0]["remote"] is True, remote_payload
+            assert remote_payload["runs"][0]["hostId"] == "ssh:remote-1", remote_payload
+            remote_projects = local_collector.projects_from_runs(remote_payload["runs"])
+            assert len(remote_projects) == 1, remote_projects
+            assert remote_projects[0]["name"] == "AdoptedProject", remote_projects
+            assert remote_projects[0]["isGit"] is False, remote_projects
+
+            local_collector.LATEST_SNAPSHOT = {"runs": remote_payload["runs"]}
+            kill_status, kill_payload = local_collector.kill_run(adopted_run["id"])
+            assert kill_status == 409, kill_payload
+            assert "remote" in kill_payload["error"], kill_payload
+
+            bundle_bytes = local_collector.base64.b64decode(local_collector.remote_agent_bundle_text())
+            with local_collector.zipfile.ZipFile(local_collector.io.BytesIO(bundle_bytes)) as archive:
+                assert set(archive.namelist()) == set(local_collector.REMOTE_AGENT_BUNDLE_FILES)
+            python_path, install_root = local_collector.parse_remote_agent_prepare_output(
+                "noise\nEXPMON_PYTHON=/opt/expmon/bin/python\nEXPMON_ROOT=/home/test/.local/share/expmon\n"
+            )
+            assert python_path == "/opt/expmon/bin/python", python_path
+            assert install_root == "/home/test/.local/share/expmon", install_root
+            assert local_collector.remote_agent_cli_path(install_root) == "/home/test/.local/share/expmon/scripts/expmon.py"
+            prepare_command = local_collector.remote_agent_prepare_python_command()
+            assert "psutil" in prepare_command and ".venv" in prepare_command, prepare_command
+
             assert local_collector.safe_git_relative_path("src/App.tsx")
             assert local_collector.safe_git_relative_path("docs/run protocol.md")
             assert not local_collector.safe_git_relative_path("")
@@ -148,6 +221,7 @@ def main() -> None:
     finally:
         local_collector.CONFIG = original_config
         local_collector.SSH_SERVERS_PATH = original_ssh_path
+        local_collector.LATEST_SNAPSHOT = original_snapshot
 
 
 if __name__ == "__main__":

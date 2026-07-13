@@ -128,14 +128,23 @@ For stable remote monitoring on Windows, macOS, or Ubuntu, run the lightweight r
 python scripts/remote_agent.py --host 127.0.0.1 --port 5194
 ```
 
-When ExpMon is installed on the remote machine, the local collector uses a discovery handshake before falling back to one-shot SSH sampling:
+The local collector prefers the remote agent through an SSH tunnel before falling back to one-shot SSH sampling:
 
-1. Try a direct remote agent at `http://<ssh-host>:5194/api/host` for explicitly exposed agents.
-2. Run `expmon discover --json` over SSH.
-3. Read the standard discovery manifest (`%LOCALAPPDATA%\ExpMon\discovery.json` on Windows or `~/.config/expmon/discovery.json` on Linux/macOS).
-4. If the remote agent is running on remote `127.0.0.1`, open an SSH tunnel from a local random port to the remote agent and sample through that tunnel.
+1. Run `expmon discover --json` over SSH or read the standard discovery manifest.
+2. On a first Linux/macOS connection with no ExpMon installation, install the lightweight agent under `~/.local/share/expmon`; install missing `psutil` in the user environment first and fall back to an isolated venv when needed.
+3. Bind the agent to remote `127.0.0.1:5194`, open an SSH tunnel, and sample through the tunnel.
+4. Only when installation or tunneling is unavailable, try an explicitly exposed agent and one-shot SSH sampling.
 
-This means the recommended agent bind address is `127.0.0.1`; the remote host does not need to expose an HTTP port. Use `EXPMON_REMOTE_AGENT_PORT` on the local collector if you intentionally expose a different direct-agent port. For shared environments, set `EXPMON_AGENT_TOKEN` on the remote agent and the same value as `EXPMON_REMOTE_AGENT_TOKEN` on the local collector. Setting `EXPMON_REMOTE_AGENT_AUTOSTART=1` lets the local collector try `expmon agent start --background` when discovery finds ExpMon installed but the agent is not running.
+After a new SSH profile passes its connection test, bootstrap starts in the background. Existing profiles are also installed on their first resource sample. Installation and startup are enabled by default; set `EXPMON_REMOTE_AGENT_AUTO_INSTALL=0` or `EXPMON_REMOTE_AGENT_AUTOSTART=0` to disable them. A failed installation enters a retry cooldown and falls back without blocking other hosts. The agent publishes remote managed, adopted, and automatically discovered runs into the local **Runs** and **Projects** pages.
+
+To register a remote process that is already running, execute `adopt` on that remote host:
+
+```bash
+python scripts/expmon.py adopt --pid 3637117 --project NeuroSTORM \
+  --name hcp1200-h200-gpu0 --resource-type gpu --log-file nohup.out
+```
+
+This means the recommended agent bind address is `127.0.0.1`; the remote host does not need to expose an HTTP port. Use `EXPMON_REMOTE_AGENT_PORT` on the local collector if you intentionally expose a different direct-agent port. For shared environments, set `EXPMON_AGENT_TOKEN` on the remote agent and the same value as `EXPMON_REMOTE_AGENT_TOKEN` on the local collector.
 
 Password SSH profiles are saved locally as requested, but non-interactive connection testing and one-shot SSH snapshots require `sshpass` or switching the profile to key-based authentication.
 

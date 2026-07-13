@@ -1,6 +1,7 @@
 import base64
 import getpass
 import hashlib
+import io
 import json
 import os
 import platform
@@ -13,12 +14,13 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
 import psutil
@@ -44,6 +46,12 @@ HOST_RESOURCE_HISTORY: dict[str, list[dict[str, Any]]] = {}
 REMOTE_AGENT_UNAVAILABLE_UNTIL: dict[str, float] = {}
 REMOTE_EXPMON_DISCOVERY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 REMOTE_AGENT_TUNNELS: dict[str, dict[str, Any]] = {}
+REMOTE_AGENT_INSTALL_ATTEMPTS: dict[str, tuple[float, str]] = {}
+REMOTE_AGENT_INSTALL_IN_FLIGHT: set[str] = set()
+REMOTE_AGENT_INSTALL_LOCK = threading.Lock()
+SSH_RESOURCE_CACHE: dict[str, tuple[float, int, dict[str, Any]]] = {}
+SSH_RESOURCE_IN_FLIGHT: set[str] = set()
+SSH_RESOURCE_LOCK = threading.Lock()
 DELETABLE_RUN_STATUSES = {"finished", "failed", "killed"}
 
 NVIDIA_POWER_LIMIT_CATALOG_W = {
@@ -466,6 +474,8 @@ def validate_and_save_ssh_server(payload: dict[str, Any]) -> tuple[int, dict[str
         return 500, {"ok": False, "error": "failed to prepare ssh server"}
     test_payload = test_ssh_server_doc(server)
     write_ssh_servers_raw(saved.get("servers", []))
+    if test_payload.get("ok"):
+        start_remote_agent_bootstrap(str(server.get("id") or ""), server)
     return 200, {
         "ok": True,
         "server": public_ssh_server(server),
@@ -481,11 +491,17 @@ def delete_ssh_server(server_id: str) -> tuple[int, dict[str, Any]]:
     if len(next_servers) == len(servers):
         return 404, {"ok": False, "error": "ssh server not found"}
     write_ssh_servers_raw(next_servers)
+    with SSH_RESOURCE_LOCK:
+        SSH_RESOURCE_CACHE.pop(server_id, None)
+        SSH_RESOURCE_IN_FLIGHT.discard(server_id)
     return 200, {"ok": True, "serverId": server_id}
 
 
 def clear_ssh_servers() -> tuple[int, dict[str, Any]]:
     write_ssh_servers_raw([])
+    with SSH_RESOURCE_LOCK:
+        SSH_RESOURCE_CACHE.clear()
+        SSH_RESOURCE_IN_FLIGHT.clear()
     return 200, {"ok": True, "deleted": True}
 
 
@@ -881,7 +897,12 @@ print(json.dumps({
 """
 
 
-def run_ssh_remote_command(server: dict[str, Any], remote_command: str, timeout: int = 15) -> tuple[subprocess.CompletedProcess[str] | None, dict[str, Any] | None, int]:
+def run_ssh_remote_command(
+    server: dict[str, Any],
+    remote_command: str,
+    timeout: int = 15,
+    input_text: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str] | None, dict[str, Any] | None, int]:
     command, error_payload = ssh_command_for_server(server, remote_command)
     if error_payload:
         return None, error_payload, 400 if error_payload.get("error") else 200
@@ -894,6 +915,7 @@ def run_ssh_remote_command(server: dict[str, Any], remote_command: str, timeout:
             encoding="utf-8",
             errors="replace",
             capture_output=True,
+            input=input_text,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -1182,27 +1204,29 @@ def remote_host_payload(
     python_path: str = "",
     source: str = "ssh",
 ) -> dict[str, Any]:
+    snapshot_host = parsed.get("host") if isinstance(parsed.get("host"), dict) else parsed
+    remote_runs = normalize_remote_runs(server_id, parsed.get("runs"))
     host = {
         "id": f"ssh:{server_id}",
-        "name": str(server.get("name") or parsed.get("hostname") or server.get("host") or "remote"),
-        "os": str(parsed.get("os") or remote_os or "remote"),
+        "name": str(server.get("name") or snapshot_host.get("hostname") or snapshot_host.get("name") or server.get("host") or "remote"),
+        "os": str(snapshot_host.get("os") or remote_os or "remote"),
         "address": str(server.get("host") or ""),
-        "user": str(parsed.get("user") or server.get("username") or ""),
-        "cpuUsage": float(parsed.get("cpuUsage") or 0),
-        "memoryUsedGb": float(parsed.get("memoryUsedGb") or 0),
-        "memoryTotalGb": float(parsed.get("memoryTotalGb") or 0),
-        "memoryBreakdown": parsed.get("memoryBreakdown") if isinstance(parsed.get("memoryBreakdown"), list) else [],
-        "gpusTotal": int(parsed.get("gpusTotal") or 0),
-        "gpusBusy": int(parsed.get("gpusBusy") or 0),
-        "gpus": parsed.get("gpus") if isinstance(parsed.get("gpus"), list) else [],
-        "diskRead": float(parsed.get("diskRead") or 0),
-        "diskWrite": float(parsed.get("diskWrite") or 0),
-        "netRx": float(parsed.get("netRx") or 0),
-        "netTx": float(parsed.get("netTx") or 0),
-        "runningRuns": 0,
+        "user": str(snapshot_host.get("user") or server.get("username") or ""),
+        "cpuUsage": float(snapshot_host.get("cpuUsage") or 0),
+        "memoryUsedGb": float(snapshot_host.get("memoryUsedGb") or 0),
+        "memoryTotalGb": float(snapshot_host.get("memoryTotalGb") or 0),
+        "memoryBreakdown": snapshot_host.get("memoryBreakdown") if isinstance(snapshot_host.get("memoryBreakdown"), list) else [],
+        "gpusTotal": int(snapshot_host.get("gpusTotal") or 0),
+        "gpusBusy": int(snapshot_host.get("gpusBusy") or 0),
+        "gpus": snapshot_host.get("gpus") if isinstance(snapshot_host.get("gpus"), list) else [],
+        "diskRead": float(snapshot_host.get("diskRead") or 0),
+        "diskWrite": float(snapshot_host.get("diskWrite") or 0),
+        "netRx": float(snapshot_host.get("netRx") or 0),
+        "netTx": float(snapshot_host.get("netTx") or 0),
+        "runningRuns": len([run for run in remote_runs if run.get("status") == "running"]),
         "warnings": [],
-        "cores": parsed.get("cores") if isinstance(parsed.get("cores"), list) else [],
-        "processes": parsed.get("processes") if isinstance(parsed.get("processes"), list) else [],
+        "cores": snapshot_host.get("cores") if isinstance(snapshot_host.get("cores"), list) else [],
+        "processes": snapshot_host.get("processes") if isinstance(snapshot_host.get("processes"), list) else [],
     }
     host["history"] = update_host_history(
         str(host["id"]),
@@ -1224,9 +1248,30 @@ def remote_host_payload(
         "remoteOs": remote_os,
         "pythonPath": python_path,
         "host": host,
+        "runs": remote_runs,
         "source": source,
         "message": "remote agent snapshot ok" if source.startswith("agent") else "remote resource snapshot ok",
     }
+
+
+def normalize_remote_runs(server_id: str, raw_runs: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_runs, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw_run in raw_runs:
+        if not isinstance(raw_run, dict) or not raw_run.get("id"):
+            continue
+        run = dict(raw_run)
+        run["hostId"] = f"ssh:{server_id}"
+        run["remote"] = True
+        run["remoteServerId"] = server_id
+        run["remoteRunId"] = str(raw_run.get("id"))
+        run["visualizations"] = []
+        run["metadata"] = run_metadata_for(str(raw_run.get("id"))) or raw_run.get("metadata") or {}
+        tags = [str(tag) for tag in raw_run.get("tags") or []]
+        run["tags"] = list(dict.fromkeys([*tags, "remote"]))
+        normalized.append(run)
+    return normalized
 
 
 def free_local_port() -> int:
@@ -1250,13 +1295,13 @@ def parse_json_payload(text: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def remote_agent_json(url: str) -> dict[str, Any] | None:
+def remote_agent_json(url: str, timeout: float = 2.5) -> dict[str, Any] | None:
     headers = {"Accept": "application/json"}
     token = os.environ.get("EXPMON_REMOTE_AGENT_TOKEN", "").strip()
     if token:
         headers["X-ExpMon-Agent-Token"] = token
     try:
-        with urlopen(Request(url, headers=headers), timeout=2.5) as response:
+        with urlopen(Request(url, headers=headers), timeout=timeout) as response:
             raw = response.read(1024 * 1024).decode("utf-8", errors="replace")
     except (OSError, HTTPError, URLError):
         return None
@@ -1276,9 +1321,16 @@ def remote_agent_snapshot(server_id: str, server: dict[str, Any]) -> dict[str, A
     if unavailable_until > now:
         return None
     port = int(os.environ.get("EXPMON_REMOTE_AGENT_PORT", "5194"))
-    url = f"http://{host}:{port}/api/host"
+    base_url = f"http://{host}:{port}"
+    try:
+        timeout = max(0.2, float(os.environ.get("EXPMON_REMOTE_AGENT_DIRECT_TIMEOUT_SECONDS", "2.5")))
+    except ValueError:
+        timeout = 2.5
     started = time.time()
-    parsed = remote_agent_json(url)
+    parsed = remote_agent_json(f"{base_url}/api/snapshot", timeout=timeout) or remote_agent_json(
+        f"{base_url}/api/host",
+        timeout=timeout,
+    )
     if parsed is None:
         REMOTE_AGENT_UNAVAILABLE_UNTIL[server_id] = now + 60
         return None
@@ -1295,13 +1347,206 @@ def remote_agent_snapshot(server_id: str, server: dict[str, Any]) -> dict[str, A
     )
 
 
+REMOTE_AGENT_BUNDLE_FILES = (
+    "scripts/remote_agent.py",
+    "scripts/local_collector.py",
+    "scripts/expmon.py",
+    "expmon.yaml",
+    "package.json",
+)
+
+
+def environment_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def remote_agent_bundle_text() -> str:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for relative_path in REMOTE_AGENT_BUNDLE_FILES:
+            source = APP_ROOT / relative_path
+            archive.writestr(relative_path, source.read_bytes())
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def remote_agent_prepare_python_command() -> str:
+    candidates = [
+        "$HOME/miniconda3/bin/python",
+        "$HOME/anaconda3/bin/python",
+        "$HOME/mambaforge/bin/python",
+        "$HOME/miniforge3/bin/python",
+        "$HOME/miniconda/bin/python",
+        "$HOME/anaconda/bin/python",
+        "/opt/conda/bin/python",
+        "/opt/mamba/bin/python",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+        "python3",
+        "python",
+    ]
+    candidate_text = " ".join(
+        f'"{candidate}"' if candidate.startswith("$HOME/") else shlex.quote(candidate)
+        for candidate in candidates
+    )
+    check = shlex.quote("import psutil")
+    return (
+        'root="${XDG_DATA_HOME:-$HOME/.local/share}/expmon"; mkdir -p "$root"; '
+        f"for candidate in {candidate_text}; do "
+        'resolved="$candidate"; if [ ! -x "$resolved" ]; then resolved=$(command -v "$candidate" 2>/dev/null || true); fi; '
+        f'if [ -n "$resolved" ] && "$resolved" -c {check} >/dev/null 2>&1; then '
+        'printf "EXPMON_PYTHON=%s\\nEXPMON_ROOT=%s\\n" "$resolved" "$root"; exit 0; fi; done; '
+        'base=""; '
+        f"for candidate in {candidate_text}; do "
+        'resolved="$candidate"; if [ ! -x "$resolved" ]; then resolved=$(command -v "$candidate" 2>/dev/null || true); fi; '
+        'if [ -n "$resolved" ]; then base="$resolved"; break; fi; done; '
+        'if [ -z "$base" ]; then echo "No remote Python interpreter found" 1>&2; exit 127; fi; '
+        f'if "$base" -m pip install --user --disable-pip-version-check "psutil>=5.9,<8" 1>&2 '
+        f'&& "$base" -c {check} >/dev/null 2>&1; then '
+        'printf "EXPMON_PYTHON=%s\\nEXPMON_ROOT=%s\\n" "$base" "$root"; exit 0; fi; '
+        'venv="$root/.venv"; '
+        'if [ ! -x "$venv/bin/python" ]; then "$base" -m venv "$venv" >/dev/null 2>&1 || '
+        '{ echo "Unable to create the ExpMon agent virtual environment" 1>&2; exit 2; }; fi; '
+        f'if ! "$venv/bin/python" -c {check} >/dev/null 2>&1; then '
+        '"$venv/bin/python" -m pip install --disable-pip-version-check "psutil>=5.9,<8" 1>&2 || exit 3; fi; '
+        'printf "EXPMON_PYTHON=%s\\nEXPMON_ROOT=%s\\n" "$venv/bin/python" "$root"'
+    )
+
+
+def parse_remote_agent_prepare_output(stdout: str) -> tuple[str, str]:
+    values: dict[str, str] = {}
+    for line in stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in {"EXPMON_PYTHON", "EXPMON_ROOT"}:
+            values[key] = value.strip()
+    return values.get("EXPMON_PYTHON", ""), values.get("EXPMON_ROOT", "")
+
+
+def remote_agent_cli_path(install_root: str) -> str:
+    return f"{install_root.rstrip('/')}/scripts/expmon.py"
+
+
+def install_remote_expmon_agent(
+    server_id: str,
+    server: dict[str, Any],
+    remote_os: str | None = None,
+) -> dict[str, Any] | None:
+    if not environment_flag("EXPMON_REMOTE_AGENT_AUTO_INSTALL", True):
+        return None
+    detected_os = str(remote_os or detect_remote_os(server)).lower()
+    if detected_os not in {"linux", "macos"}:
+        return None
+
+    now = time.time()
+    try:
+        cooldown = max(0, float(os.environ.get("EXPMON_REMOTE_AGENT_INSTALL_RETRY_SECONDS", "300")))
+    except ValueError:
+        cooldown = 300
+    with REMOTE_AGENT_INSTALL_LOCK:
+        previous = REMOTE_AGENT_INSTALL_ATTEMPTS.get(server_id)
+        if previous and now - previous[0] < cooldown:
+            return None
+        if server_id in REMOTE_AGENT_INSTALL_IN_FLIGHT:
+            return None
+        REMOTE_AGENT_INSTALL_IN_FLIGHT.add(server_id)
+
+    error = "remote agent bootstrap failed"
+    try:
+        prepared, error_payload, _ = run_ssh_remote_command(
+            server,
+            remote_agent_prepare_python_command(),
+            timeout=120,
+        )
+        if error_payload or not prepared or prepared.returncode != 0:
+            error = str((error_payload or {}).get("message") or (prepared.stderr if prepared else "") or error)
+            return None
+        python_path, install_root = parse_remote_agent_prepare_output(prepared.stdout)
+        if not python_path or not install_root:
+            error = "remote Python preparation returned an incomplete result"
+            return None
+
+        extraction_script = """import base64
+import io
+import os
+import shlex
+import sys
+import zipfile
+from pathlib import Path
+
+root = Path(sys.argv[1])
+python_path = sys.argv[2]
+payload = base64.b64decode(sys.stdin.read().encode('ascii'))
+with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+    archive.extractall(root)
+wrapper = Path.home() / '.local' / 'bin' / 'expmon'
+wrapper.parent.mkdir(parents=True, exist_ok=True)
+wrapper.write_text(
+    '#!/bin/sh\\nexec ' + shlex.quote(python_path) + ' ' + shlex.quote(str(root / 'scripts' / 'expmon.py')) + ' "$@"\\n',
+    encoding='utf-8',
+)
+os.chmod(wrapper, 0o755)
+"""
+        upload_command = " ".join(
+            [
+                shlex.quote(python_path),
+                "-c",
+                shlex.quote(extraction_script),
+                shlex.quote(install_root),
+                shlex.quote(python_path),
+            ]
+        )
+        uploaded, error_payload, _ = run_ssh_remote_command(
+            server,
+            upload_command,
+            timeout=45,
+            input_text=remote_agent_bundle_text(),
+        )
+        if error_payload or not uploaded or uploaded.returncode != 0:
+            error = str((error_payload or {}).get("message") or (uploaded.stderr if uploaded else "") or error)
+            return None
+
+        remote_cli = remote_agent_cli_path(install_root)
+        start_command = " ".join(
+            [
+                shlex.quote(python_path),
+                shlex.quote(remote_cli),
+                "agent start --background --bind 127.0.0.1 --port 5194",
+            ]
+        )
+        started, error_payload, _ = run_ssh_remote_command(server, start_command, timeout=12)
+        if error_payload or not started or started.returncode != 0:
+            error = str((error_payload or {}).get("message") or (started.stderr if started else "") or error)
+            return None
+
+        for _ in range(10):
+            REMOTE_EXPMON_DISCOVERY_CACHE.pop(server_id, None)
+            time.sleep(0.4)
+            discovery = remote_expmon_discovery(server_id, server, remote_os=detected_os)
+            agent = discovery.get("agent") if isinstance(discovery and discovery.get("agent"), dict) else {}
+            if discovery and agent.get("running"):
+                error = ""
+                REMOTE_AGENT_INSTALL_ATTEMPTS.pop(server_id, None)
+                return discovery
+        error = "remote agent did not publish discovery metadata after startup"
+        return None
+    finally:
+        with REMOTE_AGENT_INSTALL_LOCK:
+            REMOTE_AGENT_INSTALL_IN_FLIGHT.discard(server_id)
+            if error:
+                REMOTE_AGENT_INSTALL_ATTEMPTS[server_id] = (time.time(), error[:500])
+
+
 def remote_expmon_discovery(server_id: str, server: dict[str, Any], remote_os: str | None = None) -> dict[str, Any] | None:
     now = time.time()
     cached = REMOTE_EXPMON_DISCOVERY_CACHE.get(server_id)
     if cached and now - cached[0] < 60:
         return cached[1]
 
-    commands = ["expmon discover --json"]
+    commands = ["expmon discover --json", '"$HOME/.local/bin/expmon" discover --json']
     for command in commands:
         completed, _, _ = run_ssh_remote_command(server, command, timeout=8)
         if completed and completed.returncode == 0:
@@ -1318,7 +1563,7 @@ def remote_expmon_discovery(server_id: str, server: dict[str, Any], remote_os: s
             "if (Test-Path $p) { Get-Content -Raw -Encoding UTF8 $p }\""
         )
     else:
-        manifest_command = "sh -lc 'p=\"${XDG_CONFIG_HOME:-$HOME/.config}/expmon/discovery.json\"; if [ -f \"$p\" ]; then cat \"$p\"; fi'"
+        manifest_command = 'p="${XDG_CONFIG_HOME:-$HOME/.config}/expmon/discovery.json"; if [ -f "$p" ]; then cat "$p"; fi'
     completed, _, _ = run_ssh_remote_command(server, manifest_command, timeout=8)
     if completed and completed.returncode == 0:
         parsed = parse_json_payload(completed.stdout)
@@ -1343,7 +1588,7 @@ def ensure_remote_agent_tunnel(server_id: str, server: dict[str, Any], agent: di
     if existing:
         process = existing.get("process")
         if isinstance(process, subprocess.Popen) and process.poll() is None:
-            return f"http://127.0.0.1:{existing.get('localPort')}/api/host"
+            return f"http://127.0.0.1:{existing.get('localPort')}"
     local_port = free_local_port()
     command, error_payload = ssh_tunnel_command_for_server(server, local_port, remote_host, port)
     if error_payload or not command:
@@ -1366,27 +1611,42 @@ def ensure_remote_agent_tunnel(server_id: str, server: dict[str, Any], agent: di
     if process.poll() is not None:
         REMOTE_AGENT_TUNNELS.pop(server_id, None)
         return None
-    return f"http://127.0.0.1:{local_port}/api/host"
+    return f"http://127.0.0.1:{local_port}"
 
 
 def remote_expmon_agent_snapshot(server_id: str, server: dict[str, Any], remote_os: str | None = None) -> dict[str, Any] | None:
     discovery = remote_expmon_discovery(server_id, server, remote_os=remote_os)
     if not discovery:
-        return None
+        discovery = install_remote_expmon_agent(server_id, server, remote_os=remote_os)
+        if not discovery:
+            return None
     agent = discovery.get("agent") if isinstance(discovery.get("agent"), dict) else {}
     if not agent.get("running"):
-        if os.environ.get("EXPMON_REMOTE_AGENT_AUTOSTART", "").strip() == "1" and agent.get("installed"):
-            run_ssh_remote_command(server, "expmon agent start --background --bind 127.0.0.1 --port 5194", timeout=8)
+        if environment_flag("EXPMON_REMOTE_AGENT_AUTOSTART", True) and agent.get("installed"):
+            install_root = str(discovery.get("installRoot") or "").strip()
+            python_path = str(discovery.get("pythonPath") or "").strip()
+            if install_root and python_path and str(discovery.get("platform") or remote_os or "").lower() != "windows":
+                remote_cli = remote_agent_cli_path(install_root)
+                start_command = " ".join(
+                    [
+                        shlex.quote(python_path),
+                        shlex.quote(remote_cli),
+                        "agent start --background --bind 127.0.0.1 --port 5194",
+                    ]
+                )
+            else:
+                start_command = "expmon agent start --background --bind 127.0.0.1 --port 5194"
+            run_ssh_remote_command(server, start_command, timeout=8)
             REMOTE_EXPMON_DISCOVERY_CACHE.pop(server_id, None)
             discovery = remote_expmon_discovery(server_id, server, remote_os=remote_os)
             agent = discovery.get("agent") if isinstance(discovery and discovery.get("agent"), dict) else {}
         if not agent.get("running"):
             return None
     started = time.time()
-    url = ensure_remote_agent_tunnel(server_id, server, agent)
-    if not url:
+    base_url = ensure_remote_agent_tunnel(server_id, server, agent)
+    if not base_url:
         return None
-    parsed = remote_agent_json(url)
+    parsed = remote_agent_json(f"{base_url}/api/snapshot", timeout=20) or remote_agent_json(f"{base_url}/api/host")
     if parsed is None:
         REMOTE_AGENT_TUNNELS.pop(server_id, None)
         return None
@@ -1402,18 +1662,88 @@ def remote_expmon_agent_snapshot(server_id: str, server: dict[str, Any], remote_
     )
 
 
-def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
+def start_remote_agent_bootstrap(server_id: str, server: dict[str, Any]) -> None:
+    if not server_id or not environment_flag("EXPMON_REMOTE_AGENT_AUTO_INSTALL", True):
+        return
+
+    def worker() -> None:
+        remote_expmon_agent_snapshot(server_id, server)
+
+    threading.Thread(
+        target=worker,
+        name=f"expmon-agent-bootstrap-{server_id}",
+        daemon=True,
+    ).start()
+
+
+def ssh_resource_cache_seconds() -> int:
+    raw_value = os.environ.get("EXPMON_SSH_RESOURCE_CACHE_SECONDS", "20").strip()
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return 20
+
+
+def ssh_resource_initializing_payload(server_id: str, server: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "supported": True,
+        "initializing": True,
+        "refreshInProgress": True,
+        "server": public_ssh_server(server),
+        "sampledAt": datetime.now().isoformat(timespec="seconds"),
+        "message": "remote resource refresh started",
+    }
+
+
+def cached_ssh_resource_snapshot(server_id: str, max_age_seconds: int | None = None) -> tuple[int, dict[str, Any]] | None:
+    with SSH_RESOURCE_LOCK:
+        cached = SSH_RESOURCE_CACHE.get(server_id)
+    if not cached:
+        return None
+    cached_at, status, payload = cached
+    if max_age_seconds is not None and time.time() - cached_at > max_age_seconds:
+        return None
+    next_payload = dict(payload)
+    return status, next_payload
+
+
+def cache_ssh_resource_snapshot(server_id: str, status: int, payload: dict[str, Any]) -> None:
+    with SSH_RESOURCE_LOCK:
+        SSH_RESOURCE_CACHE[server_id] = (time.time(), status, dict(payload))
+
+
+def refresh_ssh_resource_cache(server_id: str) -> None:
+    try:
+        status, payload = collect_ssh_remote_resource_snapshot(server_id)
+        cache_ssh_resource_snapshot(server_id, status, payload)
+    finally:
+        with SSH_RESOURCE_LOCK:
+            SSH_RESOURCE_IN_FLIGHT.discard(server_id)
+
+
+def start_ssh_resource_refresh(server_id: str) -> bool:
+    with SSH_RESOURCE_LOCK:
+        if server_id in SSH_RESOURCE_IN_FLIGHT:
+            return False
+        SSH_RESOURCE_IN_FLIGHT.add(server_id)
+    thread = threading.Thread(target=refresh_ssh_resource_cache, args=(server_id,), daemon=True)
+    thread.start()
+    return True
+
+
+def collect_ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
     server = ssh_server_by_id(server_id)
     if not server:
         return 404, {"ok": False, "error": "ssh server not found"}
 
-    agent_payload = remote_agent_snapshot(server_id, server)
-    if agent_payload:
-        return 200, agent_payload
-
     expmon_agent_payload = remote_expmon_agent_snapshot(server_id, server)
     if expmon_agent_payload:
         return 200, expmon_agent_payload
+
+    agent_payload = remote_agent_snapshot(server_id, server)
+    if agent_payload:
+        return 200, agent_payload
 
     remote_os = detect_remote_os(server)
     if remote_os == "windows":
@@ -1487,6 +1817,63 @@ def ssh_remote_resource_snapshot(server_id: str) -> tuple[int, dict[str, Any]]:
         python_path=python_path,
         source="ssh",
     )
+
+
+def ssh_remote_resource_snapshot(server_id: str, background: bool = False) -> tuple[int, dict[str, Any]]:
+    server = ssh_server_by_id(server_id)
+    if not server:
+        return 404, {"ok": False, "error": "ssh server not found"}
+
+    if background:
+        cached = cached_ssh_resource_snapshot(server_id, ssh_resource_cache_seconds())
+        if cached:
+            return cached
+        stale_cached = cached_ssh_resource_snapshot(server_id)
+        start_ssh_resource_refresh(server_id)
+        if stale_cached:
+            status, payload = stale_cached
+            payload["refreshInProgress"] = True
+            return status, payload
+        return 200, ssh_resource_initializing_payload(server_id, server)
+
+    with SSH_RESOURCE_LOCK:
+        in_flight = server_id in SSH_RESOURCE_IN_FLIGHT
+    if in_flight:
+        cached = cached_ssh_resource_snapshot(server_id)
+        if cached:
+            status, payload = cached
+            payload["refreshInProgress"] = True
+            return status, payload
+        return 200, ssh_resource_initializing_payload(server_id, server)
+
+    status, payload = collect_ssh_remote_resource_snapshot(server_id)
+    cache_ssh_resource_snapshot(server_id, status, payload)
+    return status, payload
+
+
+def cached_remote_monitoring() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    hosts: list[dict[str, Any]] = []
+    runs: list[dict[str, Any]] = []
+    for server in dedupe_ssh_servers(read_ssh_servers_raw()):
+        server_id = str(server.get("id") or "")
+        if not server_id:
+            continue
+        fresh = cached_ssh_resource_snapshot(server_id, ssh_resource_cache_seconds())
+        if fresh is None:
+            start_ssh_resource_refresh(server_id)
+        cached = fresh or cached_ssh_resource_snapshot(server_id)
+        if cached is None:
+            continue
+        status, payload = cached
+        if status >= 400 or not payload.get("ok"):
+            continue
+        host = payload.get("host")
+        if isinstance(host, dict):
+            hosts.append(dict(host))
+        for run in payload.get("runs") or []:
+            if isinstance(run, dict):
+                runs.append(dict(run))
+    return hosts, runs
 
 
 def mib(value: float) -> float:
@@ -2786,6 +3173,8 @@ def kill_run(run_id: str) -> tuple[int, dict[str, Any]]:
         run = next((item for item in fresh.get("runs") or [] if str(item.get("id")) == run_id), None)
     if not run:
         return 404, {"ok": False, "error": "run not found"}
+    if run.get("remote"):
+        return 409, {"ok": False, "error": "remote run termination is not supported by the local collector"}
     if run.get("status") != "running":
         return 409, {"ok": False, "error": f"run is {run.get('status')}"}
 
@@ -2816,6 +3205,8 @@ def delete_run_record(run_id: str) -> tuple[int, dict[str, Any]]:
     run = next((item for item in fresh.get("runs") or [] if str(item.get("id")) == run_id), None)
     if not run:
         return 404, {"ok": False, "error": "run not found"}
+    if run.get("remote"):
+        return 409, {"ok": False, "error": "remote run records must be managed on the remote host"}
 
     status = str(run.get("status") or "")
     if status not in DELETABLE_RUN_STATUSES:
@@ -2944,18 +3335,29 @@ def project_path_for_run(run: dict[str, Any]) -> Path | None:
 def projects_from_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     projects: dict[str, dict[str, Any]] = {}
     for run in runs:
-        project_path = project_path_for_run(run)
-        if not project_path:
-            continue
-        root = git_root_for_path(project_path)
-        project_id = project_id_for_path(project_path)
+        is_remote = bool(run.get("remote"))
+        if is_remote:
+            project_name = str(run.get("project") or "remote-project")
+            project_path_text = str(run.get("cwd") or project_name)
+            project_id = f"remote:{run.get('hostId')}:{project_name}"
+            item_name = project_name
+            is_git = False
+        else:
+            project_path = project_path_for_run(run)
+            if not project_path:
+                continue
+            root = git_root_for_path(project_path)
+            project_id = project_id_for_path(project_path)
+            project_path_text = str(project_path)
+            item_name = project_path.name or str(project_path)
+            is_git = root is not None and root.resolve() == project_path.resolve()
         item = projects.setdefault(
             project_id,
             {
                 "id": project_id,
-                "name": project_path.name or str(project_path),
-                "path": str(project_path),
-                "isGit": root is not None and root.resolve() == project_path.resolve(),
+                "name": item_name,
+                "path": project_path_text,
+                "isGit": is_git,
                 "runs": [],
                 "runningRuns": 0,
                 "finishedRuns": 0,
@@ -3575,6 +3977,7 @@ def run_from_manifest(run_dir: Path, gpus: list[dict[str, Any]]) -> dict[str, An
     entry_doc = manifest.get("entrypoint", {}) if isinstance(manifest.get("entrypoint"), dict) else {}
     process_doc = manifest.get("process", {}) if isinstance(manifest.get("process"), dict) else {}
     time_doc = manifest.get("time", {}) if isinstance(manifest.get("time"), dict) else {}
+    logs_doc = manifest.get("logs", {}) if isinstance(manifest.get("logs"), dict) else {}
     manifest_run_id = str(run_doc.get("run_id") or run_dir.name)
 
     command = str(entry_doc.get("command") or status_doc.get("command") or "")
@@ -3606,6 +4009,12 @@ def run_from_manifest(run_dir: Path, gpus: list[dict[str, Any]]) -> dict[str, An
     runtime_seconds = runtime_from_status(status_doc, started_at)
     latest_metric, best_metric = summarize_metric(metrics)
     logs = tail_lines(run_dir / "stdout.log", 60) + tail_lines(run_dir / "stderr.log", 30)
+    external_stdout = str(logs_doc.get("stdout") or "")
+    external_stderr = str(logs_doc.get("stderr") or "")
+    if external_stdout:
+        logs = tail_lines(Path(external_stdout), 60)
+    if external_stderr:
+        logs += tail_lines(Path(external_stderr), 30)
     if not logs:
         logs = [f"manifest discovered at {run_dir}", f"status={status}"]
     merged_hparams = hparams_for_process(command, cwd)
@@ -3725,11 +4134,13 @@ def collect_snapshot() -> dict[str, Any]:
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             pass
 
-    runs = protocol_runs + unmanaged_runs
-    attribute_gpu_processes_to_runs(runs, gpus)
+    local_runs = protocol_runs + unmanaged_runs
+    attribute_gpu_processes_to_runs(local_runs, gpus)
+    remote_hosts, remote_runs = cached_remote_monitoring()
+    runs = local_runs + remote_runs
     runs.sort(key=lambda item: (bool((item.get("metadata") or {}).get("pinned")), str(item.get("rootCreateTime", ""))), reverse=True)
     projects = projects_from_runs(runs)
-    diagnostics = build_diagnostics(runs, gpus)
+    diagnostics = build_diagnostics(local_runs, gpus)
     memory = psutil.virtual_memory()
     disk = psutil.disk_io_counters()
     net = psutil.net_io_counters()
@@ -3781,11 +4192,12 @@ def collect_snapshot() -> dict[str, Any]:
                 "diskWrite": disk_write_rate,
                 "netRx": net_rx_rate,
                 "netTx": net_tx_rate,
-                "runningRuns": len([run for run in runs if run.get("status") == "running"]),
-                "warnings": [] if runs else ["No experiment runs"],
+                "runningRuns": len([run for run in local_runs if run.get("status") == "running"]),
+                "warnings": [] if local_runs else ["No experiment runs"],
                 "cores": cpu_cores,
                 "history": host_history,
-            }
+            },
+            *remote_hosts,
         ],
         "runs": runs,
         "projects": projects,
@@ -3861,7 +4273,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
-        path = urlparse(self.path).path
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
         if path == "/api/ssh/servers":
             status, payload = validate_and_save_ssh_server(read_json_body(self))
             self.send_json(payload, status=status)
@@ -3898,7 +4311,9 @@ class Handler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/ssh/servers/([^/]+)/resources", path)
         if match:
             server_id = unquote(match.group(1))
-            status, payload = ssh_remote_resource_snapshot(server_id)
+            query = parse_qs(parsed_url.query)
+            background = query.get("background", ["0"])[0] in {"1", "true", "yes"}
+            status, payload = ssh_remote_resource_snapshot(server_id, background=background)
             self.send_json(payload, status=status)
             return
         match = re.fullmatch(r"/api/projects/([^/]+)/git/(pull|push|commit-message|commit)", path)

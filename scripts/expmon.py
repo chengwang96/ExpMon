@@ -37,6 +37,8 @@ DISCOVERY_CAPABILITIES = [
     "gpu",
     "gpu_process",
     "process",
+    "runs",
+    "adopt",
     "memory_breakdown",
     "disk_network",
 ]
@@ -117,6 +119,7 @@ def discover(args: argparse.Namespace) -> int:
         "os": platform.platform(),
         "hostname": socket.gethostname(),
         "user": getpass.getuser(),
+        "pythonPath": sys.executable,
         "installRoot": str(APP_ROOT),
         "discoveryPath": str(discovery_path()),
         "agent": {
@@ -440,6 +443,111 @@ def launch(args: argparse.Namespace) -> int:
     return int(exit_code)
 
 
+def adopt(args: argparse.Namespace) -> int:
+    if psutil is None:
+        print("expmon adopt requires psutil", file=sys.stderr)
+        return 2
+
+    try:
+        process = psutil.Process(args.pid)
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            raise psutil.NoSuchProcess(args.pid)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        print(f"process {args.pid} is not running", file=sys.stderr)
+        return 2
+    except psutil.AccessDenied:
+        print(f"access denied while inspecting process {args.pid}", file=sys.stderr)
+        return 2
+
+    with process.oneshot():
+        try:
+            process_command = " ".join(process.cmdline())
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            process_command = ""
+        try:
+            process_cwd = process.cwd()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            process_cwd = ""
+        try:
+            process_user = process.username()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            process_user = os.environ.get("USERNAME") or os.environ.get("USER") or "local"
+        try:
+            root_create_time = float(process.create_time())
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            print(f"could not read the create time for process {args.pid}", file=sys.stderr)
+            return 2
+
+    command = str(args.command_text or process_command or f"pid {args.pid}")
+    cwd = str(Path(args.cwd).resolve()) if args.cwd else (process_cwd or os.getcwd())
+    logdir = Path(args.logdir or os.environ.get("EXPMON_LOGDIR") or DEFAULT_LOGDIR)
+    run_id, run_dir = make_run_dir(logdir, args.project, args.name)
+    (run_dir / "metrics.jsonl").touch()
+    (run_dir / "events.jsonl").touch()
+    copy_hparams(args.hparams, run_dir)
+
+    started_at = datetime.fromtimestamp(root_create_time).isoformat(timespec="seconds")
+    adopted_at = now_iso()
+    tags = list(dict.fromkeys([*args.tag, "adopted"]))
+    manifest: dict[str, Any] = {
+        "schema_version": "expmon.v1",
+        "run": {
+            "run_id": run_id,
+            "project": args.project,
+            "name": args.name,
+            "status": "running",
+            "resource_type": args.resource_type,
+            "tags": tags,
+        },
+        "host": {
+            "host_id": args.host_id or socket.gethostname(),
+            "hostname": socket.gethostname(),
+            "user": process_user,
+        },
+        "entrypoint": {
+            "kind": infer_entrypoint(command.split()),
+            "command": command,
+            "cwd": cwd,
+        },
+        "process": {
+            "root_pid": args.pid,
+            "root_create_time": root_create_time,
+            "adopted": True,
+        },
+        "time": {"started_at": started_at, "adopted_at": adopted_at},
+    }
+    if args.log_file:
+        manifest["logs"] = {"stdout": str(Path(args.log_file).expanduser().resolve())}
+
+    write_yaml(run_dir / "manifest.yaml", manifest)
+    write_json(
+        run_dir / "status.json",
+        {
+            "status": "running",
+            "launcher": "expmon-adopt",
+            "pid": args.pid,
+            "command": command,
+            "cwd": cwd,
+            "started_at": started_at,
+            "adopted_at": adopted_at,
+        },
+    )
+    append_jsonl(
+        run_dir / "events.jsonl",
+        {
+            "ts": adopted_at,
+            "type": "adopted",
+            "severity": "info",
+            "message": f"adopted existing process {args.pid}",
+            "fields": {"pid": args.pid, "historicalCapture": False},
+        },
+    )
+    print(f"expmon adopted pid={args.pid}")
+    print(f"expmon run_id={run_id}")
+    print(f"expmon run_dir={run_dir}")
+    return 0
+
+
 def log_metric(args: argparse.Namespace) -> int:
     run_dir_text = args.run_dir or os.environ.get("EXPMON_RUN_DIR")
     if not run_dir_text:
@@ -488,6 +596,20 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--tag", action="append", default=[])
     launch_parser.add_argument("command", nargs=argparse.REMAINDER)
     launch_parser.set_defaults(func=launch)
+
+    adopt_parser = subparsers.add_parser("adopt", help="register an already-running process without restarting it")
+    adopt_parser.add_argument("--pid", required=True, type=int)
+    adopt_parser.add_argument("--project", required=True)
+    adopt_parser.add_argument("--name", required=True)
+    adopt_parser.add_argument("--logdir")
+    adopt_parser.add_argument("--cwd")
+    adopt_parser.add_argument("--host-id")
+    adopt_parser.add_argument("--resource-type", default="unknown", choices=["cpu_only", "gpu", "hybrid", "unknown"])
+    adopt_parser.add_argument("--hparams")
+    adopt_parser.add_argument("--tag", action="append", default=[])
+    adopt_parser.add_argument("--command", dest="command_text", help="override the command read from the process")
+    adopt_parser.add_argument("--log-file", help="tail an existing nohup/stdout log from the run detail page")
+    adopt_parser.set_defaults(func=adopt)
 
     log_parser = subparsers.add_parser("log", help="append metrics to the current managed run")
     log_parser.add_argument("--run-dir")

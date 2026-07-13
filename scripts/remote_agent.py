@@ -24,7 +24,7 @@ TOKEN = os.environ.get("EXPMON_AGENT_TOKEN", "").strip()
 GPU_CACHE: tuple[float, list[dict[str, Any]]] | None = None
 GPU_CACHE_SECONDS = float(os.environ.get("EXPMON_AGENT_GPU_CACHE_SECONDS", "10"))
 APP_ROOT = Path(__file__).resolve().parents[1]
-DISCOVERY_CAPABILITIES = ["host", "gpu", "gpu_process", "process", "memory_breakdown", "disk_network"]
+DISCOVERY_CAPABILITIES = ["host", "gpu", "gpu_process", "process", "runs", "adopt", "memory_breakdown", "disk_network"]
 
 NVIDIA_POWER_LIMIT_CATALOG_W = {
     "rtx 5090": 575,
@@ -212,6 +212,7 @@ def discovery_payload(bind: str, port: int) -> dict[str, Any]:
         "os": platform.platform(),
         "hostname": socket.gethostname(),
         "user": getpass.getuser(),
+        "pythonPath": os.sys.executable,
         "installRoot": str(APP_ROOT),
         "discoveryPath": str(discovery_path()),
         "agent": {
@@ -453,6 +454,41 @@ def sample_host() -> dict[str, Any]:
     }
 
 
+def sample_snapshot() -> dict[str, Any]:
+    try:
+        import local_collector
+
+        snapshot = local_collector.collect_snapshot()
+        hosts = snapshot.get("hosts") if isinstance(snapshot.get("hosts"), list) else []
+        host = dict(hosts[0]) if hosts else sample_host()
+        host.update(
+            {
+                "hostname": socket.gethostname(),
+                "remoteOs": platform.system().lower(),
+                "pythonPath": os.sys.executable,
+                "processes": top_processes(),
+                "sampledAt": str(snapshot.get("updatedAt") or datetime.now().isoformat(timespec="seconds")),
+            }
+        )
+        return {
+            "ok": True,
+            "host": host,
+            "runs": snapshot.get("runs") if isinstance(snapshot.get("runs"), list) else [],
+            "projects": snapshot.get("projects") if isinstance(snapshot.get("projects"), list) else [],
+            "updatedAt": snapshot.get("updatedAt"),
+            "capabilities": DISCOVERY_CAPABILITIES,
+        }
+    except Exception as exc:
+        return {
+            "ok": True,
+            "host": sample_host(),
+            "runs": [],
+            "projects": [],
+            "capabilities": [item for item in DISCOVERY_CAPABILITIES if item not in {"runs", "adopt"}],
+            "warning": f"run discovery unavailable: {exc}",
+        }
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if TOKEN:
@@ -466,6 +502,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/host":
             self.send_json(sample_host())
+            return
+        if self.path == "/api/snapshot":
+            self.send_json(sample_snapshot())
             return
         self.send_error(404)
 

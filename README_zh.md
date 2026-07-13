@@ -128,14 +128,25 @@ pip install tensorboard mlflow
 python scripts/remote_agent.py --host 127.0.0.1 --port 5194
 ```
 
-当远端机器也安装了 ExpMon，本地 collector 会先做 discovery handshake，再回退到一次性 SSH 采样：
+本地 collector 会优先通过 SSH tunnel 使用 remote agent，再回退到一次性 SSH 采样：
 
-1. 先尝试直连显式暴露的 remote agent：`http://<ssh-host>:5194/api/host`。
-2. 通过 SSH 执行 `expmon discover --json`。
-3. 读取标准 discovery manifest：Windows 为 `%LOCALAPPDATA%\ExpMon\discovery.json`，Linux/macOS 为 `~/.config/expmon/discovery.json`。
-4. 如果发现远端 agent 正在远端 `127.0.0.1` 运行，本地 collector 会自动创建 SSH tunnel，从本地随机端口转发到远端 agent，再通过 tunnel 采样。
+1. 通过 SSH 执行 `expmon discover --json`，或读取标准 discovery manifest。
+2. Linux/macOS 首次连接且未发现 ExpMon 时，自动安装轻量 agent 到 `~/.local/share/expmon`；缺少 `psutil` 时会优先安装到用户环境，并在需要时回退到隔离 venv。
+3. agent 默认绑定远端 `127.0.0.1:5194`，本地 collector 自动创建 SSH tunnel 后采样。
+4. 自动安装或 tunnel 不可用时，才尝试显式暴露的 agent 和一次性 SSH 采样。
 
-因此推荐让 agent 绑定 `127.0.0.1`，远端机器不需要开放 HTTP 端口。如果确实要暴露其他直连端口，可以在本地 collector 设置 `EXPMON_REMOTE_AGENT_PORT`。共享环境中，可以在远端 agent 设置 `EXPMON_AGENT_TOKEN`，并在本地 collector 设置相同的 `EXPMON_REMOTE_AGENT_TOKEN`。设置 `EXPMON_REMOTE_AGENT_AUTOSTART=1` 后，如果 discovery 发现远端安装了 ExpMon 但 agent 未运行，本地 collector 会尝试执行 `expmon agent start --background`。
+添加 SSH 配置并通过连接测试后，bootstrap 会在后台启动；已有 SSH 配置也会在首次资源采样时补装。安装和自动启动默认开启，可分别用 `EXPMON_REMOTE_AGENT_AUTO_INSTALL=0` 和 `EXPMON_REMOTE_AGENT_AUTOSTART=0` 禁用。安装失败会进入冷却并自动降级，不会阻塞其他主机。agent 会把远端 managed、adopted 和自动发现运行合并到本地 **Runs** 与 **Projects** 页面。
+
+如果远端训练已经启动，可以直接在该服务器执行 Level B 接管，无需重启训练：
+
+```bash
+python scripts/expmon.py adopt --pid 3637117 --project NeuroSTORM \
+  --name hcp1200-h200-gpu0 --resource-type gpu --log-file nohup.out
+```
+
+`adopt` 会创建稳定的 run id、manifest 和后续资源历史，但无法补回接管前的输出、注入启动时环境变量或恢复未受 ExpMon 监督的退出码。
+
+因此推荐让 agent 绑定 `127.0.0.1`，远端机器不需要开放 HTTP 端口。如果确实要暴露其他直连端口，可以在本地 collector 设置 `EXPMON_REMOTE_AGENT_PORT`。共享环境中，可以在远端 agent 设置 `EXPMON_AGENT_TOKEN`，并在本地 collector 设置相同的 `EXPMON_REMOTE_AGENT_TOKEN`。
 
 密码配置会按要求保存在本地，但非交互式连接测试和一次性 SSH 快照需要 `sshpass`，或者把配置切换为基于密钥的认证。
 
