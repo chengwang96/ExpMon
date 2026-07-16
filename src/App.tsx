@@ -254,6 +254,9 @@ type Run = {
   command: string;
   cwd: string;
   runtime: string;
+  endedAt?: string;
+  exitCode?: number | null;
+  exitCodeKnown?: boolean;
   rootCpuPercent?: number;
   processTreeCpuPercent?: number;
   cpuPercent: number;
@@ -447,6 +450,8 @@ const TEXT = {
     userLabel: "用户",
     allUsers: "全部用户",
     runtimeLabel: "运行时长",
+    endedAtLabel: "结束时间",
+    exitCodeLabel: "退出码",
     cpuTreeLabel: "CPU 根进程/进程树",
     accessLevelLabel: "级别",
     cpu: "CPU",
@@ -665,6 +670,8 @@ const TEXT = {
     userLabel: "User",
     allUsers: "All users",
     runtimeLabel: "Runtime",
+    endedAtLabel: "Ended at",
+    exitCodeLabel: "Exit code",
     cpuTreeLabel: "CPU root/tree",
     accessLevelLabel: "Level",
     cpu: "CPU",
@@ -3531,6 +3538,7 @@ function RunDetail({
           <Readout label={t("userLabel")} value={run.user} />
           <Readout label={t("rootPid")} value={run.rootPid.toString()} />
           <Readout label={t("runtimeLabel")} value={run.runtime} />
+          {run.endedAt && <Readout label={t("endedAtLabel")} value={run.endedAt.replace("T", " ")} />}
           <Readout label={t("cpuTreeLabel")} value={`${(run.rootCpuPercent ?? 0).toFixed(1)}% / ${(run.processTreeCpuPercent ?? run.cpuPercent).toFixed(1)}%`} />
           <Readout label="GPU" value={run.gpuLabel} />
           <Readout label={t("gpuUtil")} value={formatGpuRunUsage(run, t)} />
@@ -3681,6 +3689,8 @@ function RunDetail({
           <div className="identity-list">
             <Readout label="run_id" value={run.id} />
             <Readout label="create_time" value={run.rootCreateTime} />
+            {run.endedAt && <Readout label={t("endedAtLabel")} value={run.endedAt.replace("T", " ")} />}
+            {run.endedAt && <Readout label={t("exitCodeLabel")} value={run.exitCodeKnown ? String(run.exitCode) : t("unknown")} />}
             <Readout label="cwd" value={run.cwd} />
             <Readout label="tags" value={run.tags.join(", ")} />
           </div>

@@ -542,6 +542,39 @@ def adopt(args: argparse.Namespace) -> int:
             "fields": {"pid": args.pid, "historicalCapture": False},
         },
     )
+    try:
+        import local_collector
+
+        imported = local_collector.import_tensorboard_metrics(
+            run_dir,
+            command,
+            cwd,
+            manifest.get("logs") if isinstance(manifest.get("logs"), dict) else {},
+        )
+        if int(imported.get("imported") or 0) > 0:
+            append_jsonl(
+                run_dir / "events.jsonl",
+                {
+                    "ts": now_iso(),
+                    "type": "tensorboard_metrics_imported",
+                    "severity": "info",
+                    "message": "imported existing TensorBoard scalar metrics",
+                    "fields": {
+                        "values": int(imported.get("imported") or 0),
+                        "tags": list(imported.get("tags") or []),
+                    },
+                },
+            )
+    except Exception as exc:
+        append_jsonl(
+            run_dir / "events.jsonl",
+            {
+                "ts": now_iso(),
+                "type": "tensorboard_import_warning",
+                "severity": "warning",
+                "message": f"TensorBoard metric import skipped: {exc}",
+            },
+        )
     print(f"expmon adopted pid={args.pid}")
     print(f"expmon run_id={run_id}")
     print(f"expmon run_dir={run_dir}")

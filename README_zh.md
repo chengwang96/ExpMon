@@ -98,10 +98,10 @@ collector 会把资源采样写入 `resources.jsonl`，把事件写入 `events.j
 - metric JSONL 文件
 - metric CSV 文件
 
-JSONL、CSV 和 W&B summary 可以在页面内预览。如果 collector 环境中安装了对应包，TensorBoard 和 MLflow 可以通过本地 viewer 进程打开。
+JSONL、CSV 和 W&B summary 可以在页面内预览。ExpMon 会增量导入 TensorBoard 的 `train_loss`、`valid_loss`/`val_loss` 和 `test_loss` 到 `metrics.jsonl`，包括 adopt 时已经存在的历史指标。TensorBoard 已包含在 collector 依赖中；MLflow viewer 仍为可选功能。
 
 ```powershell
-pip install tensorboard mlflow
+pip install mlflow
 ```
 
 ## 配置
@@ -131,7 +131,7 @@ python scripts/remote_agent.py --host 127.0.0.1 --port 5194
 本地 collector 会优先通过 SSH tunnel 使用 remote agent，再回退到一次性 SSH 采样：
 
 1. 通过 SSH 执行 `expmon discover --json`，或读取标准 discovery manifest。
-2. Linux/macOS 首次连接且未发现 ExpMon 时，自动安装轻量 agent 到 `~/.local/share/expmon`；缺少 `psutil` 时会优先安装到用户环境，并在需要时回退到隔离 venv。
+2. Linux/macOS 首次连接且未发现 ExpMon 时，自动安装轻量 agent 到 `~/.local/share/expmon`；缺少 `psutil` 或 TensorBoard 支持时会优先安装到用户环境，并在需要时回退到隔离 venv。
 3. agent 默认绑定远端 `127.0.0.1:5194`，本地 collector 自动创建 SSH tunnel 后采样。
 4. 自动安装或 tunnel 不可用时，才尝试显式暴露的 agent 和一次性 SSH 采样。
 
@@ -145,6 +145,8 @@ python scripts/expmon.py adopt --pid 3637117 --project NeuroSTORM \
 ```
 
 `adopt` 会创建稳定的 run id、manifest 和后续资源历史，但无法补回接管前的输出、注入启动时环境变量或恢复未受 ExpMon 监督的退出码。
+
+记录的根进程退出后，collector 会把 `finished` 和 `ended_at` 持久化到 manifest 与 `status.json`。由于 adopt 进程并非 ExpMon 的子进程，历史退出码会诚实记录为 `exit_code: null` 和 `exit_code_known: false`；`expmon launch` 仍会记录真实退出码。
 
 因此推荐让 agent 绑定 `127.0.0.1`，远端机器不需要开放 HTTP 端口。如果确实要暴露其他直连端口，可以在本地 collector 设置 `EXPMON_REMOTE_AGENT_PORT`。共享环境中，可以在远端 agent 设置 `EXPMON_AGENT_TOKEN`，并在本地 collector 设置相同的 `EXPMON_REMOTE_AGENT_TOKEN`。
 

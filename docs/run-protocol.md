@@ -53,7 +53,7 @@ python scripts/expmon.py adopt \
 
 Adoption creates a stable run id, manifest, process identity, and resource history without restarting the process. The collector infers the original start time, command, working directory, user, and process tree. `--log-file` is optional and lets the run page tail an existing `nohup` log.
 
-An adopted run is Level B rather than Level A: ExpMon cannot reconstruct output emitted before adoption, inject `EXPMON_*` environment variables into an existing process, or recover an exit code it does not supervise. New metrics can still be appended with `expmon log --run-dir <printed-run-dir> ...`.
+An adopted run is Level B rather than Level A: ExpMon cannot reconstruct output emitted before adoption, inject `EXPMON_*` environment variables into an existing process, or recover an exit code it does not supervise. The collector still persists process exit detection with `ended_at`, `exit_code: null`, and `exit_code_known: false`. Existing and growing TensorBoard loss scalars are imported into `metrics.jsonl`; new metrics can also be appended with `expmon log --run-dir <printed-run-dir> ...`.
 
 ## Level A: managed run
 
@@ -126,7 +126,7 @@ The collector also scans stdout/stderr for common failures such as CUDA OOM, NCC
 
 ## Experiment log visualization
 
-The run detail page automatically scans each managed run directory for common experiment log formats:
+The collector scans each managed run directory, explicit output/log directories from the command, and common `lightning_logs`/`runs` children for experiment log formats:
 
 - TensorBoard event files named `events.out.tfevents*`
 - Weights & Biases offline directories under `wandb/run-*` or `wandb/offline-run-*`
@@ -134,10 +134,10 @@ The run detail page automatically scans each managed run directory for common ex
 - metric JSONL files such as `metrics.jsonl`, `history.jsonl`, or `wandb-history.jsonl`
 - metric CSV files with names containing `metric`, `history`, `progress`, or `result`
 
-JSONL, CSV, and W&B summaries are previewed inline. TensorBoard and MLflow are opened through their standard local viewers when the user clicks **Open Viewer**. Install the corresponding Python packages in the environment that runs the collector:
+JSONL, CSV, and W&B summaries are previewed inline. TensorBoard loss scalars are also imported incrementally into the unified metric history. TensorBoard is a core collector dependency; install MLflow separately to open its standard local viewer:
 
 ```powershell
-pip install tensorboard mlflow
+pip install mlflow
 ```
 
 Keep `protocol.scan_roots` narrow. Scanning a dedicated run directory every 3 seconds is cheap; scanning an entire data drive is not.

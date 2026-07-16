@@ -98,10 +98,10 @@ The run detail page scans managed run directories for:
 - metric JSONL files
 - metric CSV files
 
-JSONL, CSV, and W&B summaries can be previewed inline. TensorBoard and MLflow can be opened through local viewer processes if the corresponding packages are installed in the collector environment.
+JSONL, CSV, and W&B summaries can be previewed inline. ExpMon incrementally imports TensorBoard `train_loss`, `valid_loss`/`val_loss`, and `test_loss` scalars into `metrics.jsonl`, including history that already exists when a process is adopted. TensorBoard is installed with the collector requirements; MLflow remains optional for opening its local viewer.
 
 ```powershell
-pip install tensorboard mlflow
+pip install mlflow
 ```
 
 ## Configuration
@@ -131,7 +131,7 @@ python scripts/remote_agent.py --host 127.0.0.1 --port 5194
 The local collector prefers the remote agent through an SSH tunnel before falling back to one-shot SSH sampling:
 
 1. Run `expmon discover --json` over SSH or read the standard discovery manifest.
-2. On a first Linux/macOS connection with no ExpMon installation, install the lightweight agent under `~/.local/share/expmon`; install missing `psutil` in the user environment first and fall back to an isolated venv when needed.
+2. On a first Linux/macOS connection with no ExpMon installation, install the lightweight agent under `~/.local/share/expmon`; install missing `psutil` and TensorBoard support in the user environment first and fall back to an isolated venv when needed.
 3. Bind the agent to remote `127.0.0.1:5194`, open an SSH tunnel, and sample through the tunnel.
 4. Only when installation or tunneling is unavailable, try an explicitly exposed agent and one-shot SSH sampling.
 
@@ -143,6 +143,8 @@ To register a remote process that is already running, execute `adopt` on that re
 python scripts/expmon.py adopt --pid 3637117 --project NeuroSTORM \
   --name hcp1200-h200-gpu0 --resource-type gpu --log-file nohup.out
 ```
+
+When the recorded root process exits, the collector persists `finished` and `ended_at` to both the manifest and `status.json`. Because an adopted process is not a child of ExpMon, its historical exit code is represented honestly as `exit_code: null` with `exit_code_known: false`; `expmon launch` continues to record the real exit code.
 
 This means the recommended agent bind address is `127.0.0.1`; the remote host does not need to expose an HTTP port. Use `EXPMON_REMOTE_AGENT_PORT` on the local collector if you intentionally expose a different direct-agent port. For shared environments, set `EXPMON_AGENT_TOKEN` on the remote agent and the same value as `EXPMON_REMOTE_AGENT_TOKEN` on the local collector.
 

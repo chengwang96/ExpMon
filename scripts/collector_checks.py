@@ -11,6 +11,7 @@ def main() -> None:
     original_config = local_collector.CONFIG
     original_ssh_path = local_collector.SSH_SERVERS_PATH
     original_snapshot = local_collector.LATEST_SNAPSHOT
+    original_event_accumulator = local_collector.EventAccumulator
     try:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -100,6 +101,69 @@ def main() -> None:
             })
             stale_run = local_collector.run_from_manifest(stale_run_dir, [])
             assert stale_run and stale_run["status"] == "finished", stale_run
+            persisted_status = local_collector.read_json(stale_run_dir / "status.json")
+            persisted_manifest = local_collector.read_yaml(stale_run_dir / "manifest.yaml")
+            assert persisted_status["status"] == "finished", persisted_status
+            assert persisted_status["ended_at"], persisted_status
+            assert persisted_status["exit_code"] is None, persisted_status
+            assert persisted_status["exit_code_known"] is False, persisted_status
+            assert persisted_manifest["run"]["status"] == "finished", persisted_manifest
+            assert persisted_manifest["time"]["ended_at"] == persisted_status["ended_at"], persisted_manifest
+
+            tensorboard_run_dir = workspace / "expmon-runs" / "ExperimentA" / "tensorboard-run"
+            tensorboard_output = workspace / "training-output" / "lightning_logs" / "version_0"
+            tensorboard_run_dir.mkdir(parents=True)
+            tensorboard_output.mkdir(parents=True)
+            (tensorboard_run_dir / "metrics.jsonl").touch()
+            event_file = tensorboard_output / "events.out.tfevents.test"
+            event_file.touch()
+            unrelated_events = workspace / "logs" / "other-run"
+            unrelated_events.mkdir(parents=True)
+            (unrelated_events / "events.out.tfevents.unrelated").touch()
+
+            class FakeScalarEvent:
+                def __init__(self, wall_time: float, step: int, value: float) -> None:
+                    self.wall_time = wall_time
+                    self.step = step
+                    self.value = value
+
+            class FakeEventAccumulator:
+                def __init__(self, _path: str, size_guidance: dict[str, int]) -> None:
+                    assert size_guidance == {"scalars": 0}
+
+                def Reload(self) -> None:
+                    return None
+
+                def Tags(self) -> dict[str, list[str]]:
+                    return {"scalars": ["train_loss", "val_loss", "test/loss", "epoch"]}
+
+                def Scalars(self, tag: str) -> list[FakeScalarEvent]:
+                    rows = {
+                        "train_loss": [FakeScalarEvent(1_700_000_001, 10, 0.8)],
+                        "val_loss": [FakeScalarEvent(1_700_000_002, 10, 0.7)],
+                        "test/loss": [FakeScalarEvent(1_700_000_003, 10, 0.6)],
+                        "epoch": [FakeScalarEvent(1_700_000_003, 10, 1.0)],
+                    }
+                    return rows[tag]
+
+            local_collector.EventAccumulator = FakeEventAccumulator
+            imported = local_collector.import_tensorboard_metrics(
+                tensorboard_run_dir,
+                f"python train.py --output_dir {tensorboard_output.parent.parent}",
+                str(workspace),
+            )
+            assert imported["imported"] == 3, imported
+            assert imported["eventFiles"] == 1, imported
+            imported_metrics = local_collector.read_metrics(tensorboard_run_dir)
+            imported_keys = {key for row in imported_metrics for key in row}
+            assert {"train_loss", "valid_loss", "test_loss"}.issubset(imported_keys), imported_metrics
+            repeated = local_collector.import_tensorboard_metrics(
+                tensorboard_run_dir,
+                f"python train.py --output_dir {tensorboard_output.parent.parent}",
+                str(workspace),
+            )
+            assert repeated["imported"] == 0, repeated
+            local_collector.EventAccumulator = original_event_accumulator
 
             adopted_logdir = workspace / "adopted-runs"
             adopted_args = argparse.Namespace(
@@ -222,6 +286,7 @@ def main() -> None:
         local_collector.CONFIG = original_config
         local_collector.SSH_SERVERS_PATH = original_ssh_path
         local_collector.LATEST_SNAPSHOT = original_snapshot
+        local_collector.EventAccumulator = original_event_accumulator
 
 
 if __name__ == "__main__":

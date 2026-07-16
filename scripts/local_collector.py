@@ -30,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover - PyYAML is listed in the project docs, but keep collector resilient.
     yaml = None
 
+try:
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+except ImportError:  # pragma: no cover - reported through the import result when TensorBoard is optional.
+    EventAccumulator = None
+
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 PORT = int(os.environ.get("EXPMON_COLLECTOR_PORT", "5184"))
@@ -52,6 +57,8 @@ REMOTE_AGENT_INSTALL_LOCK = threading.Lock()
 SSH_RESOURCE_CACHE: dict[str, tuple[float, int, dict[str, Any]]] = {}
 SSH_RESOURCE_IN_FLIGHT: set[str] = set()
 SSH_RESOURCE_LOCK = threading.Lock()
+RUN_FINALIZE_LOCK = threading.Lock()
+TENSORBOARD_SCAN_CACHE: dict[str, tuple[float, list[Path]]] = {}
 DELETABLE_RUN_STATUSES = {"finished", "failed", "killed"}
 
 NVIDIA_POWER_LIMIT_CATALOG_W = {
@@ -1391,7 +1398,7 @@ def remote_agent_prepare_python_command() -> str:
         f'"{candidate}"' if candidate.startswith("$HOME/") else shlex.quote(candidate)
         for candidate in candidates
     )
-    check = shlex.quote("import psutil")
+    check = shlex.quote("import psutil, tensorboard")
     return (
         'root="${XDG_DATA_HOME:-$HOME/.local/share}/expmon"; mkdir -p "$root"; '
         f"for candidate in {candidate_text}; do "
@@ -1403,14 +1410,14 @@ def remote_agent_prepare_python_command() -> str:
         'resolved="$candidate"; if [ ! -x "$resolved" ]; then resolved=$(command -v "$candidate" 2>/dev/null || true); fi; '
         'if [ -n "$resolved" ]; then base="$resolved"; break; fi; done; '
         'if [ -z "$base" ]; then echo "No remote Python interpreter found" 1>&2; exit 127; fi; '
-        f'if "$base" -m pip install --user --disable-pip-version-check "psutil>=5.9,<8" 1>&2 '
+        f'if "$base" -m pip install --user --disable-pip-version-check "psutil>=5.9,<8" "tensorboard>=2.14,<3" 1>&2 '
         f'&& "$base" -c {check} >/dev/null 2>&1; then '
         'printf "EXPMON_PYTHON=%s\\nEXPMON_ROOT=%s\\n" "$base" "$root"; exit 0; fi; '
         'venv="$root/.venv"; '
         'if [ ! -x "$venv/bin/python" ]; then "$base" -m venv "$venv" >/dev/null 2>&1 || '
         '{ echo "Unable to create the ExpMon agent virtual environment" 1>&2; exit 2; }; fi; '
         f'if ! "$venv/bin/python" -c {check} >/dev/null 2>&1; then '
-        '"$venv/bin/python" -m pip install --disable-pip-version-check "psutil>=5.9,<8" 1>&2 || exit 3; fi; '
+        '"$venv/bin/python" -m pip install --disable-pip-version-check "psutil>=5.9,<8" "tensorboard>=2.14,<3" 1>&2 || exit 3; fi; '
         'printf "EXPMON_PYTHON=%s\\nEXPMON_ROOT=%s\\n" "$venv/bin/python" "$root"'
     )
 
@@ -2894,6 +2901,340 @@ def read_metrics(run_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
+TENSORBOARD_PATH_OPTIONS = {
+    "--default_root_dir",
+    "--log_dir",
+    "--logdir",
+    "--output_dir",
+    "--output-dir",
+    "--save_dir",
+    "--save-dir",
+}
+
+
+def canonical_tensorboard_metric(tag: str) -> str | None:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(tag).lower()).strip("_")
+    if normalized.endswith(("train_loss", "training_loss", "loss_train")):
+        return "train_loss"
+    if normalized.endswith(("valid_loss", "validation_loss", "val_loss", "loss_valid", "loss_validation", "loss_val")):
+        return "valid_loss"
+    if normalized.endswith(("test_loss", "testing_loss", "loss_test")):
+        return "test_loss"
+    return None
+
+
+def resolved_artifact_path(value: str, cwd: str) -> Path:
+    path = Path(os.path.expandvars(os.path.expanduser(value)))
+    if not path.is_absolute():
+        path = Path(cwd or ".") / path
+    return path.resolve()
+
+
+def run_artifact_roots(run_dir: Path, command: str, cwd: str, logs_doc: dict[str, Any]) -> list[Path]:
+    roots: list[Path] = [run_dir]
+    explicit_roots: list[Path] = []
+    try:
+        tokens = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        tokens = command.split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        option, separator, inline_value = token.partition("=")
+        value = inline_value if separator and option in TENSORBOARD_PATH_OPTIONS else ""
+        if option in TENSORBOARD_PATH_OPTIONS and not value and index + 1 < len(tokens):
+            index += 1
+            value = tokens[index]
+        if value:
+            explicit_roots.append(resolved_artifact_path(value, cwd))
+        index += 1
+
+    roots.extend(explicit_roots)
+    if not explicit_roots:
+        cwd_path = Path(cwd) if cwd else None
+        if cwd_path and cwd_path.exists():
+            for name in ("lightning_logs", "runs", "logs", "output", "outputs"):
+                candidate = cwd_path / name
+                if candidate.exists():
+                    roots.append(candidate.resolve())
+        for key in ("stdout", "stderr"):
+            value = str(logs_doc.get(key) or "").strip()
+            if value:
+                parent = resolved_artifact_path(value, cwd).parent
+                if parent.exists():
+                    roots.append(parent)
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = os.path.normcase(str(root))
+        if key in seen or not root.exists():
+            continue
+        seen.add(key)
+        deduped.append(root)
+    return deduped
+
+
+def scan_tensorboard_event_files(
+    run_dir: Path,
+    command: str,
+    cwd: str,
+    logs_doc: dict[str, Any],
+) -> list[Path]:
+    cache_key = str(run_dir.resolve())
+    now = time.time()
+    cached = TENSORBOARD_SCAN_CACHE.get(cache_key)
+    if cached and now - cached[0] < 10:
+        return [path for path in cached[1] if path.exists()]
+
+    max_depth = 8
+    max_files = 200
+    ignored_dirs = {".git", ".venv", "node_modules", "__pycache__"}
+    files: list[Path] = []
+    seen: set[str] = set()
+    for root in run_artifact_roots(run_dir, command, cwd, logs_doc):
+        if root.is_file():
+            candidates = [root]
+        else:
+            candidates = []
+            for current, directories, filenames in os.walk(root):
+                current_path = Path(current)
+                try:
+                    depth = len(current_path.relative_to(root).parts)
+                except ValueError:
+                    continue
+                directories[:] = [name for name in directories if name not in ignored_dirs]
+                if depth >= max_depth:
+                    directories[:] = []
+                for filename in filenames:
+                    if filename.startswith("events.out.tfevents") or ".tfevents." in filename:
+                        candidates.append(current_path / filename)
+        for path in candidates:
+            key = os.path.normcase(str(path.resolve()))
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(path.resolve())
+            if len(files) >= max_files:
+                break
+        if len(files) >= max_files:
+            break
+    files.sort(key=lambda path: (path.stat().st_mtime_ns if path.exists() else 0, str(path)))
+    TENSORBOARD_SCAN_CACHE[cache_key] = (now, files)
+    return files
+
+
+def import_tensorboard_metrics(
+    run_dir: Path,
+    command: str = "",
+    cwd: str = "",
+    logs_doc: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if EventAccumulator is None:
+        return {"ok": False, "available": False, "imported": 0, "message": "tensorboard is not installed"}
+    logs_doc = logs_doc if isinstance(logs_doc, dict) else {}
+    event_files = scan_tensorboard_event_files(run_dir, command, cwd, logs_doc)
+    state_path = run_dir / "tensorboard-import.json"
+    state = read_json(state_path)
+    file_state = state.get("files") if isinstance(state.get("files"), dict) else {}
+    next_file_state = dict(file_state)
+    metrics_path = run_dir / "metrics.jsonl"
+    try:
+        max_events = max(1, int(os.environ.get("EXPMON_TENSORBOARD_MAX_EVENTS_PER_TAG", "5000")))
+    except ValueError:
+        max_events = 5000
+    imported_rows = 0
+    imported_values = 0
+    imported_tags: set[str] = set()
+
+    for event_file in event_files:
+        try:
+            before = event_file.stat()
+        except OSError:
+            continue
+        key = str(event_file)
+        previous = file_state.get(key) if isinstance(file_state.get(key), dict) else {}
+        if previous.get("size") == before.st_size and previous.get("mtimeNs") == before.st_mtime_ns:
+            continue
+        previous_tags = previous.get("tags") if isinstance(previous.get("tags"), dict) else {}
+        next_tags = dict(previous_tags)
+        grouped: dict[tuple[float, int], dict[str, float]] = {}
+        try:
+            accumulator = EventAccumulator(str(event_file), size_guidance={"scalars": 0})
+            accumulator.Reload()
+            scalar_tags = accumulator.Tags().get("scalars", [])
+            for tag in scalar_tags:
+                canonical = canonical_tensorboard_metric(tag)
+                if not canonical:
+                    continue
+                events = accumulator.Scalars(tag)[-max_events:]
+                previous_tag = previous_tags.get(tag) if isinstance(previous_tags.get(tag), dict) else {}
+                previous_pair = (
+                    float(previous_tag.get("wallTime") or 0),
+                    int(previous_tag["step"]) if "step" in previous_tag else -1,
+                )
+                for event in events:
+                    pair = (float(event.wall_time), int(event.step))
+                    if pair <= previous_pair:
+                        continue
+                    grouped.setdefault(pair, {})[canonical] = float(event.value)
+                    imported_values += 1
+                    imported_tags.add(canonical)
+                if events:
+                    last = max(events, key=lambda event: (float(event.wall_time), int(event.step)))
+                    next_tags[tag] = {"wallTime": float(last.wall_time), "step": int(last.step)}
+        except Exception:
+            continue
+
+        for (wall_time, step), values in sorted(grouped.items()):
+            append_jsonl(
+                metrics_path,
+                {
+                    "ts": datetime.fromtimestamp(wall_time).isoformat(timespec="seconds"),
+                    "step": step,
+                    "metrics": values,
+                    "source": "tensorboard",
+                },
+            )
+            imported_rows += 1
+        next_file_state[key] = {
+            "size": before.st_size,
+            "mtimeNs": before.st_mtime_ns,
+            "tags": next_tags,
+        }
+
+    if next_file_state != file_state:
+        write_json(
+            state_path,
+            {
+                "version": 1,
+                "updatedAt": datetime.now().isoformat(timespec="seconds"),
+                "files": next_file_state,
+            },
+        )
+    return {
+        "ok": True,
+        "available": True,
+        "imported": imported_values,
+        "rows": imported_rows,
+        "tags": sorted(imported_tags),
+        "eventFiles": len(event_files),
+    }
+
+
+def parsed_timestamp(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+
+def last_jsonl_timestamp(path: Path) -> float | None:
+    for line in reversed(tail_lines(path, 20)):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        timestamp = parsed_timestamp(payload.get("ts") or payload.get("time"))
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def infer_run_ended_at(
+    run_dir: Path,
+    status_doc: dict[str, Any],
+    command: str,
+    cwd: str,
+    logs_doc: dict[str, Any],
+) -> str:
+    existing = parsed_timestamp(status_doc.get("ended_at"))
+    if existing is not None:
+        return datetime.fromtimestamp(existing).isoformat(timespec="seconds")
+    candidates = [
+        last_jsonl_timestamp(run_dir / "resources.jsonl"),
+        last_jsonl_timestamp(run_dir / "metrics.jsonl"),
+    ]
+    for key in ("stdout", "stderr"):
+        value = str(logs_doc.get(key) or "").strip()
+        if not value:
+            continue
+        try:
+            candidates.append(resolved_artifact_path(value, cwd).stat().st_mtime)
+        except OSError:
+            pass
+    for event_file in scan_tensorboard_event_files(run_dir, command, cwd, logs_doc):
+        try:
+            candidates.append(event_file.stat().st_mtime)
+        except OSError:
+            pass
+    valid = [value for value in candidates if value is not None]
+    ended_timestamp = max(valid) if valid else time.time()
+    return datetime.fromtimestamp(ended_timestamp).isoformat(timespec="seconds")
+
+
+def finalize_stale_run(
+    run_dir: Path,
+    manifest: dict[str, Any],
+    status_doc: dict[str, Any],
+    command: str,
+    cwd: str,
+    logs_doc: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    with RUN_FINALIZE_LOCK:
+        latest_status = read_json(run_dir / "status.json") or dict(status_doc)
+        latest_manifest = read_yaml(run_dir / "manifest.yaml") or dict(manifest)
+        if str(latest_status.get("status") or "") != "running":
+            return latest_manifest, latest_status
+
+        import_tensorboard_metrics(run_dir, command, cwd, logs_doc)
+        ended_at = infer_run_ended_at(run_dir, latest_status, command, cwd, logs_doc)
+        final_status = "finished"
+        exit_code = latest_status.get("exit_code")
+        latest_status.update(
+            {
+                "status": final_status,
+                "ended_at": ended_at,
+                "exit_code": exit_code if isinstance(exit_code, int) else None,
+                "exit_code_known": isinstance(exit_code, int),
+                "finish_detected_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        run_doc = latest_manifest.setdefault("run", {})
+        time_doc = latest_manifest.setdefault("time", {})
+        if isinstance(run_doc, dict):
+            run_doc["status"] = final_status
+        if isinstance(time_doc, dict):
+            time_doc["ended_at"] = ended_at
+        write_json(run_dir / "status.json", latest_status)
+        write_yaml(run_dir / "manifest.yaml", latest_manifest)
+        append_jsonl(
+            run_dir / "events.jsonl",
+            {
+                "ts": latest_status["finish_detected_at"],
+                "type": "process_exit_detected",
+                "severity": "info",
+                "message": "root process exited; run status persisted",
+                "fields": {
+                    "endedAt": ended_at,
+                    "exitCode": latest_status["exit_code"],
+                    "exitCodeKnown": latest_status["exit_code_known"],
+                },
+            },
+        )
+        return latest_manifest, latest_status
+
+
 def resource_record_from_json(row: dict[str, Any]) -> dict[str, Any]:
     record: dict[str, Any] = {"time": str(row.get("time") or row.get("ts") or format_clock())}
     for key, value in row.items():
@@ -3969,8 +4310,6 @@ def run_from_manifest(run_dir: Path, gpus: list[dict[str, Any]]) -> dict[str, An
         return None
     status_doc = read_json(run_dir / "status.json")
     hparams = read_yaml(run_dir / "hparams.yaml")
-    metrics = read_metrics(run_dir)
-    events = read_events(run_dir)
 
     run_doc = manifest.get("run", {}) if isinstance(manifest.get("run"), dict) else {}
     host_doc = manifest.get("host", {}) if isinstance(manifest.get("host"), dict) else {}
@@ -4002,9 +4341,18 @@ def run_from_manifest(run_dir: Path, gpus: list[dict[str, Any]]) -> dict[str, An
             live_run = None
     else:
         if stale_running_record:
-            status = "finished"
+            manifest, status_doc = finalize_stale_run(run_dir, manifest, status_doc, command, cwd, logs_doc)
+            run_doc = manifest.get("run", {}) if isinstance(manifest.get("run"), dict) else {}
+            time_doc = manifest.get("time", {}) if isinstance(manifest.get("time"), dict) else {}
+            status = str(status_doc.get("status") or "finished")
+        else:
+            import_tensorboard_metrics(run_dir, command, cwd, logs_doc)
         live_run = None
 
+    if alive:
+        import_tensorboard_metrics(run_dir, command, cwd, logs_doc)
+    metrics = read_metrics(run_dir)
+    events = read_events(run_dir)
     started_at = str(time_doc.get("started_at") or status_doc.get("started_at") or "")
     runtime_seconds = runtime_from_status(status_doc, started_at)
     latest_metric, best_metric = summarize_metric(metrics)
@@ -4059,6 +4407,9 @@ def run_from_manifest(run_dir: Path, gpus: list[dict[str, Any]]) -> dict[str, An
         "command": shorten_command(command),
         "cwd": cwd,
         "runtime": format_runtime(runtime_seconds),
+        "endedAt": str(status_doc.get("ended_at") or time_doc.get("ended_at") or ""),
+        "exitCode": status_doc.get("exit_code") if isinstance(status_doc.get("exit_code"), int) else None,
+        "exitCodeKnown": bool(status_doc.get("exit_code_known", isinstance(status_doc.get("exit_code"), int))),
         "rootCpuPercent": float(tree.get("cpu") or 0),
         "processTreeCpuPercent": cpu,
         "cpuPercent": cpu,
