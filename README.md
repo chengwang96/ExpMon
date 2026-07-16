@@ -1,75 +1,79 @@
-# ExpMon - Local-First Experiment, GPU, and SSH Host Monitor
+# ExpMon
+
+**One desktop app for experiments, GPUs, and SSH servers.**
 
 [中文文档](README_zh.md)
 
-ExpMon is a local-first experiment task monitor. It tracks managed and discovered experiment processes, host resources, GPU usage, metrics, logs, and common experiment log formats from a browser UI.
+![Windows desktop](https://img.shields.io/badge/Windows-desktop-0078D4?logo=windows11&logoColor=white)
+![Electron](https://img.shields.io/badge/Electron-client-47848F?logo=electron&logoColor=white)
+![Python](https://img.shields.io/badge/Python-collector-3776AB?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-2E8B79)
 
-## Quick Start
+ExpMon gives research teams one local-first view of training processes, GPU servers, metrics, logs, and failures. Add an SSH host once; ExpMon installs and tunnels its lightweight agent automatically, then merges remote resources and runs into the same desktop UI.
 
-Install frontend dependencies:
+![ExpMon resource dashboard](docs/images/expmon-dashboard.png)
+
+_Screenshots use privacy-safe demo data and can be regenerated with `npm run screenshots:readme`._
+
+## Why ExpMon
+
+- **See the whole fleet:** CPU, memory, every GPU, per-core load, power, temperature, I/O, and active processes across local and SSH hosts.
+- **Understand the experiment:** a run is its root process, process tree, resources, metrics, logs, events, hyperparameters, and Git project, not just a PID.
+- **Find runs you did not launch:** automatic discovery and `adopt` bring existing training processes into Projects and Runs without restarting them.
+- **Keep control local:** credentials and monitoring data stay on your machine; remote agents bind to loopback and are reached through SSH tunnels.
+- **Use the logs you already have:** TensorBoard loss scalars, JSONL, CSV, W&B offline runs, and MLflow directories appear alongside resource history.
+
+## Product Tour
+
+### One view for every SSH host
+
+Compare hosts at a glance, then inspect CPU cores, memory categories, GPUs, and attributed GPU processes on a single server.
+
+![ExpMon Host and SSH server monitoring](docs/images/expmon-hosts.png)
+
+### Runs organized by project and user
+
+Filter work by user and resource type, distinguish running, finished, and failed experiments, and open any row for its process tree, curves, metrics, events, and logs.
+
+![ExpMon experiment runs](docs/images/expmon-runs.png)
+
+## Get Started
+
+### Windows desktop client
+
+From a source checkout:
 
 ```powershell
 npm ci
-```
-
-Install Python collector dependencies:
-
-```powershell
 python -m pip install -r requirements.txt
-```
-
-For UI regression tests, install the development dependencies and Playwright browser runtime:
-
-```powershell
-python -m pip install -r requirements-dev.txt
-python -m playwright install chromium
-```
-
-Start the local collector:
-
-```powershell
-npm run collector
-```
-
-Start the frontend:
-
-```powershell
-npm run dev
-```
-
-Open the Vite URL shown in the terminal, usually `http://127.0.0.1:5173`.
-
-Or start both collector and frontend with one PowerShell script:
-
-```powershell
-npm run start:local
-```
-
-Custom ports or a local config file can be passed directly:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start-expmon.ps1 -CollectorPort 5185 -FrontendPort 5174 -Config .\expmon-local.yaml
-```
-
-Copy `.env.example` to a local `.env` file when you want to persist frontend or collector environment overrides. Local `.env` files are ignored by Git.
-
-## Windows Desktop Client
-
-The Electron client bundles the production React UI and a standalone Python collector sidecar. It chooses a free loopback port, authenticates renderer requests with a per-launch token, waits for collector health, and stops the collector process tree when the window exits. The installed client does not require a separate Python or Node.js installation.
-
-Run the desktop client from the repository:
-
-```powershell
 npm run desktop:start
 ```
 
-Build the Python sidecar and NSIS installer:
+Build the standalone Python sidecar and Windows installer:
 
 ```powershell
 npm run desktop:dist
 ```
 
-The installer is written to `release-client/ExpMon-Setup-<version>-x64.exe`. Desktop configuration, SSH profiles, run metadata, managed run files, and collector logs are stored under Electron's ExpMon user-data directory. Development builds can be checked end to end with `npm run test:desktop`.
+The installer is written to `release-client/ExpMon-Setup-<version>-x64.exe`. Installed builds bundle the React UI and Python collector, choose a free loopback port, authenticate local API requests with a per-launch token, and clean up the collector process tree on exit. Users do not need a separate Python or Node.js installation.
+
+Desktop configuration, SSH profiles, run metadata, managed runs, and collector logs live in Electron's ExpMon user-data directory.
+
+### Browser development mode
+
+Start the collector and Vite frontend together:
+
+```powershell
+npm run start:local
+```
+
+Open `http://127.0.0.1:5173`. Custom ports and a local config can be supplied with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-expmon.ps1 -CollectorPort 5185 -FrontendPort 5174 -Config .\expmon-local.yaml
+```
+
+Copy `.env.example` to `.env` for local environment overrides. Both files containing local state and generated desktop artifacts are ignored by Git.
 
 ## Managed Runs
 
@@ -210,6 +214,12 @@ Run the privacy scan before publishing or committing generated fixtures:
 
 ```powershell
 npm run test:privacy
+```
+
+Regenerate the README's privacy-safe Electron screenshots:
+
+```powershell
+npm run screenshots:readme
 ```
 
 Set `EXPMON_FRONTEND_URL` when the frontend is served on a custom port.

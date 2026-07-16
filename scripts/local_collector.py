@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - reported through the import result whe
 APP_ROOT = Path(os.environ.get("EXPMON_APP_ROOT") or Path(__file__).resolve().parents[1]).resolve()
 PORT = int(os.environ.get("EXPMON_COLLECTOR_PORT", "5184"))
 API_TOKEN = os.environ.get("EXPMON_API_TOKEN", "")
+SNAPSHOT_FIXTURE_PATH = Path(os.environ["EXPMON_SNAPSHOT_FIXTURE"]).resolve() if os.environ.get("EXPMON_SNAPSHOT_FIXTURE") else None
 SAMPLE_CONFIG_PATH = APP_ROOT / "expmon.yaml"
 CONFIG_FILE = Path(os.environ.get("EXPMON_CONFIG", APP_ROOT / "expmon-local.yaml"))
 LATEST_SNAPSHOT: dict[str, Any] | None = None
@@ -4564,11 +4565,40 @@ def collect_snapshot() -> dict[str, Any]:
 
 
 def snapshot() -> dict[str, Any]:
+    if SNAPSHOT_FIXTURE_PATH:
+        try:
+            payload = json.loads(SNAPSHOT_FIXTURE_PATH.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return {**payload, "updatedAt": datetime.now().isoformat(timespec="seconds")}
+        except (OSError, json.JSONDecodeError):
+            pass
     with SNAPSHOT_LOCK:
         cached = LATEST_SNAPSHOT
     if cached is not None:
         return cached
     return collect_snapshot()
+
+
+def fixture_remote_resource_payload(server_id: str) -> dict[str, Any] | None:
+    if not SNAPSHOT_FIXTURE_PATH:
+        return None
+    payload = snapshot()
+    server = next((item for item in payload.get("sshServers", []) if str(item.get("id")) == server_id), None)
+    host = next((item for item in payload.get("hosts", []) if str(item.get("id")) == f"ssh:{server_id}"), None)
+    if not isinstance(server, dict) or not isinstance(host, dict):
+        return None
+    return {
+        "ok": True,
+        "supported": True,
+        "source": "agent-tunnel",
+        "server": server,
+        "sampledAt": datetime.now().isoformat(timespec="seconds"),
+        "latencyMs": 12,
+        "remoteOs": "linux",
+        "pythonPath": "/opt/expmon/bin/python",
+        "host": host,
+        "runs": [run for run in payload.get("runs", []) if str(run.get("hostId")) == f"ssh:{server_id}"],
+    }
 
 
 def sample_loop() -> None:
@@ -4674,6 +4704,10 @@ class Handler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/ssh/servers/([^/]+)/resources", path)
         if match:
             server_id = unquote(match.group(1))
+            fixture_payload = fixture_remote_resource_payload(server_id)
+            if fixture_payload:
+                self.send_json(fixture_payload)
+                return
             query = parse_qs(parsed_url.query)
             background = query.get("background", ["0"])[0] in {"1", "true", "yes"}
             status, payload = ssh_remote_resource_snapshot(server_id, background=background)
@@ -4747,8 +4781,9 @@ def api_request_authorized(provided_token: str | None) -> bool:
 
 
 def main() -> None:
-    thread = threading.Thread(target=sample_loop, daemon=True)
-    thread.start()
+    if not SNAPSHOT_FIXTURE_PATH:
+        thread = threading.Thread(target=sample_loop, daemon=True)
+        thread.start()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"local collector listening on http://127.0.0.1:{PORT}")
     print(f"config roots: {', '.join(str(root) for root in configured_roots())}")

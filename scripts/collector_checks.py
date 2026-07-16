@@ -13,6 +13,7 @@ def main() -> None:
     original_snapshot = local_collector.LATEST_SNAPSHOT
     original_event_accumulator = local_collector.EventAccumulator
     original_api_token = local_collector.API_TOKEN
+    original_snapshot_fixture_path = local_collector.SNAPSHOT_FIXTURE_PATH
     try:
         local_collector.API_TOKEN = ""
         assert local_collector.api_request_authorized(None)
@@ -23,6 +24,20 @@ def main() -> None:
 
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
+            fixture_path = workspace / "snapshot.json"
+            fixture_path.write_text(
+                '{"hosts":[{"id":"ssh:demo"}],"runs":[{"id":"run-1","hostId":"ssh:demo"}],'
+                '"sshServers":[{"id":"demo","name":"Demo"}]}',
+                encoding="utf-8",
+            )
+            local_collector.SNAPSHOT_FIXTURE_PATH = fixture_path
+            fixture_snapshot = local_collector.snapshot()
+            assert fixture_snapshot["hosts"][0]["id"] == "ssh:demo", fixture_snapshot
+            fixture_remote = local_collector.fixture_remote_resource_payload("demo")
+            assert fixture_remote and fixture_remote["source"] == "agent-tunnel", fixture_remote
+            assert fixture_remote["runs"][0]["id"] == "run-1", fixture_remote
+            local_collector.SNAPSHOT_FIXTURE_PATH = original_snapshot_fixture_path
+
             project_root = workspace / "ExperimentA"
             run_cwd = project_root / "scripts" / "train"
             run_cwd.mkdir(parents=True)
@@ -296,6 +311,7 @@ def main() -> None:
         local_collector.LATEST_SNAPSHOT = original_snapshot
         local_collector.EventAccumulator = original_event_accumulator
         local_collector.API_TOKEN = original_api_token
+        local_collector.SNAPSHOT_FIXTURE_PATH = original_snapshot_fixture_path
 
 
 if __name__ == "__main__":

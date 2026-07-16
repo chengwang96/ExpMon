@@ -1,75 +1,79 @@
-# ExpMon - 本地优先的实验任务、GPU 与 SSH 主机监控
+# ExpMon
+
+**一个客户端，看清所有实验、GPU 与 SSH 服务器。**
 
 [English README](README.md)
 
-ExpMon 是一个本地优先的实验任务监控工具。它通过浏览器界面跟踪受管理和自动发现的实验进程、主机资源、GPU 使用情况、指标、日志，以及常见的实验日志格式。
+![Windows desktop](https://img.shields.io/badge/Windows-desktop-0078D4?logo=windows11&logoColor=white)
+![Electron](https://img.shields.io/badge/Electron-client-47848F?logo=electron&logoColor=white)
+![Python](https://img.shields.io/badge/Python-collector-3776AB?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-2E8B79)
+
+ExpMon 为研究团队提供一个本地优先的统一视图，把训练进程、GPU 服务器、指标、日志和失败信息放在一起。SSH 主机只需添加一次，ExpMon 会自动安装并通过 tunnel 连接轻量 agent，再把远端资源和任务合并到同一个桌面界面。
+
+![ExpMon 资源总览](docs/images/expmon-dashboard.png)
+
+_截图使用隐私安全的演示数据，可以通过 `npm run screenshots:readme` 重新生成。_
+
+## 为什么使用 ExpMon
+
+- **一眼看清整个集群：** 在本机和 SSH 主机之间统一查看 CPU、内存、每张 GPU、每核负载、功耗、温度、I/O 和活跃进程。
+- **理解实验，而不只是看到 PID：** 一个 Run 包含根进程、进程树、资源、指标、日志、事件、超参数和 Git 项目。
+- **发现并接管已启动任务：** 自动发现和 `adopt` 可以把没有通过 ExpMon 启动的训练纳入 Projects 与 Runs，无需重启训练。
+- **数据和控制留在本地：** 凭据与监控数据保存在本机；远端 agent 只绑定 loopback，并通过 SSH tunnel 访问。
+- **直接利用已有实验日志：** TensorBoard loss、JSONL、CSV、W&B offline run 和 MLflow 目录会与资源历史一起呈现。
+
+## 产品界面
+
+### 所有 SSH 主机，一个入口
+
+先横向比较主机，再进入单台服务器查看 CPU 核心、内存分类、GPU 和归属到任务的 GPU 进程。
+
+![ExpMon Host 与 SSH 服务器监控](docs/images/expmon-hosts.png)
+
+### 按项目和用户组织 Runs
+
+按用户和资源类型筛选任务，区分运行中、已完成和失败的实验，并打开任意任务查看进程树、曲线、指标、事件和日志。
+
+![ExpMon 实验任务列表](docs/images/expmon-runs.png)
 
 ## 快速开始
 
-安装前端依赖：
+### Windows 桌面客户端
+
+从源码启动：
 
 ```powershell
 npm ci
-```
-
-安装 Python collector 依赖：
-
-```powershell
 python -m pip install -r requirements.txt
-```
-
-如果要运行 UI 回归测试，请安装开发依赖和 Playwright 浏览器运行时：
-
-```powershell
-python -m pip install -r requirements-dev.txt
-python -m playwright install chromium
-```
-
-启动本地 collector：
-
-```powershell
-npm run collector
-```
-
-启动前端：
-
-```powershell
-npm run dev
-```
-
-打开终端里显示的 Vite 地址，通常是 `http://127.0.0.1:5173`。
-
-也可以用一个 PowerShell 脚本同时启动 collector 和前端：
-
-```powershell
-npm run start:local
-```
-
-自定义端口或本地配置文件可以直接传给脚本：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\start-expmon.ps1 -CollectorPort 5185 -FrontendPort 5174 -Config .\expmon-local.yaml
-```
-
-如果需要持久化前端或 collector 的环境变量覆盖项，可以把 `.env.example` 复制为本地 `.env` 文件。本地 `.env` 文件会被 Git 忽略。
-
-## Windows 桌面客户端
-
-Electron 客户端会打包生产版 React 界面和独立 Python collector sidecar。它会选择空闲的本机端口，用每次启动生成的 token 验证 renderer 请求，等待 collector 健康检查通过，并在窗口退出时清理整个 collector 进程树。安装后的客户端不需要用户另行安装 Python 或 Node.js。
-
-从仓库启动桌面客户端：
-
-```powershell
 npm run desktop:start
 ```
 
-构建 Python sidecar 和 NSIS 安装包：
+构建独立 Python sidecar 和 Windows 安装包：
 
 ```powershell
 npm run desktop:dist
 ```
 
-安装包输出到 `release-client/ExpMon-Setup-<version>-x64.exe`。桌面配置、SSH profile、运行元数据、受管理运行文件和 collector 日志存放在 Electron 的 ExpMon 用户数据目录。可以运行 `npm run test:desktop` 对桌面客户端做端到端检查。
+安装包输出到 `release-client/ExpMon-Setup-<version>-x64.exe`。安装版内置 React UI 和 Python collector，自动选择空闲的 loopback 端口，用每次启动生成的 token 保护本地 API，并在退出时清理 collector 进程树。用户无需另行安装 Python 或 Node.js。
+
+桌面配置、SSH profile、运行元数据、受管理运行和 collector 日志存放在 Electron 的 ExpMon 用户数据目录。
+
+### 浏览器开发模式
+
+同时启动 collector 和 Vite 前端：
+
+```powershell
+npm run start:local
+```
+
+打开 `http://127.0.0.1:5173`。自定义端口或本地配置可以通过以下命令传入：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-expmon.ps1 -CollectorPort 5185 -FrontendPort 5174 -Config .\expmon-local.yaml
+```
+
+需要本地环境变量覆盖时，可以把 `.env.example` 复制为 `.env`。包含本地状态的文件和生成的桌面产物都会被 Git 忽略。
 
 ## 受管理的运行
 
@@ -212,6 +216,12 @@ npm run test:collector
 
 ```powershell
 npm run test:privacy
+```
+
+重新生成 README 中隐私安全的 Electron 客户端截图：
+
+```powershell
+npm run screenshots:readme
 ```
 
 当前端服务使用自定义端口时，请设置 `EXPMON_FRONTEND_URL`。

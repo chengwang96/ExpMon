@@ -23,12 +23,13 @@
     "test:ui": "python scripts/regression.py",
     "test:collector": "python scripts/collector_checks.py",
     "test:desktop": "node scripts/desktop-smoke.cjs",
-    "test:desktop:syntax": "node --check desktop/main.cjs && node --check desktop/preload.cjs && node --check desktop/before-pack.cjs && node --check scripts/desktop-smoke.cjs",
+    "test:desktop:syntax": "node --check desktop/main.cjs && node --check desktop/preload.cjs && node --check desktop/before-pack.cjs && node --check scripts/desktop-smoke.cjs && node --check scripts/capture-readme-screenshots.cjs",
     "test:privacy": "python scripts/privacy_scan.py",
     "desktop:start": "npm run build && electron .",
     "desktop:sidecar": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-sidecar.ps1",
     "desktop:pack": "npm run build && npm run desktop:sidecar && electron-builder --dir",
     "desktop:dist": "npm run build && npm run desktop:sidecar && electron-builder --win nsis",
+    "screenshots:readme": "npm run build && node scripts/capture-readme-screenshots.cjs",
     "check:release": "npm run build && npm run test:collector && npm run test:desktop:syntax && npm run test:privacy"
   },
   "devDependencies": {

@@ -6,6 +6,9 @@ const net = require("node:net");
 const path = require("node:path");
 
 const SOURCE_ROOT = path.resolve(__dirname, "..");
+if (process.env.EXPMON_DESKTOP_DATA_DIR) {
+  app.setPath("userData", path.resolve(process.env.EXPMON_DESKTOP_DATA_DIR));
+}
 let collectorProcess = null;
 let collectorLog = null;
 let mainWindow = null;
@@ -187,6 +190,31 @@ async function runSmokeCapture(window, collectorUrl, logPath) {
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
+  const smokeView = process.env.EXPMON_DESKTOP_SMOKE_VIEW || "dashboard";
+  const navLabels = { dashboard: "Resources", hosts: "Host / SSH", runs: "Runs" };
+  const navLabel = navLabels[smokeView];
+  if (navLabel) {
+    await window.webContents.executeJavaScript(`(() => {
+      const englishButton = [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "EN");
+      englishButton?.click();
+      const target = [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === ${JSON.stringify(navLabel)});
+      target?.click();
+    })()`);
+    await new Promise((resolve) => setTimeout(resolve, 750));
+  }
+  if (smokeView === "hosts") {
+    await window.webContents.executeJavaScript(`(() => {
+      const target = [...document.querySelectorAll("button")].find((button) => {
+        const text = button.textContent.replace(/\s+/g, " ").trim();
+        return text.startsWith("H200-01") && text.includes("CPU");
+      });
+      target?.click();
+    })()`);
+  }
+  const settleMs = Number(process.env.EXPMON_DESKTOP_SMOKE_SETTLE_MS || 0);
+  if (settleMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, settleMs));
+  }
   fs.mkdirSync(outputDir, { recursive: true });
   const image = await window.webContents.capturePage();
   fs.writeFileSync(path.join(outputDir, "desktop.png"), image.toPNG());
@@ -195,6 +223,7 @@ async function runSmokeCapture(window, collectorUrl, logPath) {
     url: window.webContents.getURL(),
     collectorUrl,
     collectorLog: logPath,
+    smokeView,
     ...rendererState,
   }, null, 2));
   app.quit();

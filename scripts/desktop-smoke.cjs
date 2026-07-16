@@ -3,8 +3,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const outputDir = path.join(root, "build", "desktop-smoke");
-const dataDir = path.join(outputDir, "data");
+const outputDir = path.resolve(process.env.EXPMON_DESKTOP_SMOKE_OUTPUT || path.join(root, "build", "desktop-smoke"));
+const dataDir = path.resolve(process.env.EXPMON_DESKTOP_DATA_DIR || path.join(outputDir, "data"));
 const screenshotPath = path.join(outputDir, "desktop.png");
 const resultPath = path.join(outputDir, "result.json");
 fs.mkdirSync(outputDir, { recursive: true });
