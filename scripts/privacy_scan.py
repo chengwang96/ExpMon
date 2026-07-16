@@ -9,8 +9,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SKIP_DIRS = {
     ".git",
+    "build",
     "node_modules",
     "dist",
+    "release",
     "screenshots",
     "__pycache__",
     ".venv",
@@ -68,7 +70,7 @@ def should_scan(path: Path) -> bool:
     relative_text = str(relative).replace("\\", "/")
     if relative_text in SKIP_FILES:
         return False
-    if any(part in SKIP_DIRS for part in relative.parts):
+    if any(part in SKIP_DIRS or part.startswith("release-") for part in relative.parts):
         return False
     if path.suffix.lower() in SKIP_SUFFIXES:
         return False

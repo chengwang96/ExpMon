@@ -1,6 +1,7 @@
 import base64
 import getpass
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -36,8 +37,9 @@ except ImportError:  # pragma: no cover - reported through the import result whe
     EventAccumulator = None
 
 
-APP_ROOT = Path(__file__).resolve().parents[1]
+APP_ROOT = Path(os.environ.get("EXPMON_APP_ROOT") or Path(__file__).resolve().parents[1]).resolve()
 PORT = int(os.environ.get("EXPMON_COLLECTOR_PORT", "5184"))
+API_TOKEN = os.environ.get("EXPMON_API_TOKEN", "")
 SAMPLE_CONFIG_PATH = APP_ROOT / "expmon.yaml"
 CONFIG_FILE = Path(os.environ.get("EXPMON_CONFIG", APP_ROOT / "expmon-local.yaml"))
 LATEST_SNAPSHOT: dict[str, Any] | None = None
@@ -4588,7 +4590,15 @@ def sample_loop() -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def ensure_authorized(self) -> bool:
+        if api_request_authorized(self.headers.get("X-ExpMon-Token")):
+            return True
+        self.send_json({"ok": False, "error": "unauthorized"}, status=401)
+        return False
+
     def do_GET(self) -> None:
+        if not self.ensure_authorized():
+            return
         path = urlparse(self.path).path
         if path == "/api/snapshot":
             self.send_json(snapshot())
@@ -4624,6 +4634,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        if not self.ensure_authorized():
+            return
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         if path == "/api/ssh/servers":
@@ -4682,6 +4694,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_DELETE(self) -> None:
+        if not self.ensure_authorized():
+            return
         path = urlparse(self.path).path
         if path == "/api/ssh/servers":
             status, payload = clear_ssh_servers()
@@ -4713,15 +4727,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_cors_headers(self) -> None:
         origin = self.headers.get("Origin") or "http://127.0.0.1:5173"
-        if re.fullmatch(r"https?://(127\.0\.0\.1|localhost):\d+", origin):
+        if origin == "null" and API_TOKEN:
+            self.send_header("Access-Control-Allow-Origin", "null")
+        elif re.fullmatch(r"https?://(127\.0\.0\.1|localhost):\d+", origin):
             self.send_header("Access-Control-Allow-Origin", origin)
         else:
             self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:5173")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-ExpMon-Token")
 
     def log_message(self, format: str, *args: Any) -> None:
         return
+
+
+def api_request_authorized(provided_token: str | None) -> bool:
+    if not API_TOKEN:
+        return True
+    return hmac.compare_digest(str(provided_token or ""), API_TOKEN)
 
 
 def main() -> None:

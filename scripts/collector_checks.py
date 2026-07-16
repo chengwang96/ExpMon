@@ -12,7 +12,15 @@ def main() -> None:
     original_ssh_path = local_collector.SSH_SERVERS_PATH
     original_snapshot = local_collector.LATEST_SNAPSHOT
     original_event_accumulator = local_collector.EventAccumulator
+    original_api_token = local_collector.API_TOKEN
     try:
+        local_collector.API_TOKEN = ""
+        assert local_collector.api_request_authorized(None)
+        local_collector.API_TOKEN = "desktop-secret"
+        assert local_collector.api_request_authorized("desktop-secret")
+        assert not local_collector.api_request_authorized(None)
+        assert not local_collector.api_request_authorized("wrong-secret")
+
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             project_root = workspace / "ExperimentA"
@@ -287,6 +295,7 @@ def main() -> None:
         local_collector.SSH_SERVERS_PATH = original_ssh_path
         local_collector.LATEST_SNAPSHOT = original_snapshot
         local_collector.EventAccumulator = original_event_accumulator
+        local_collector.API_TOKEN = original_api_token
 
 
 if __name__ == "__main__":

@@ -53,6 +53,24 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-expmon.ps1 -CollectorPo
 
 Copy `.env.example` to a local `.env` file when you want to persist frontend or collector environment overrides. Local `.env` files are ignored by Git.
 
+## Windows Desktop Client
+
+The Electron client bundles the production React UI and a standalone Python collector sidecar. It chooses a free loopback port, authenticates renderer requests with a per-launch token, waits for collector health, and stops the collector process tree when the window exits. The installed client does not require a separate Python or Node.js installation.
+
+Run the desktop client from the repository:
+
+```powershell
+npm run desktop:start
+```
+
+Build the Python sidecar and NSIS installer:
+
+```powershell
+npm run desktop:dist
+```
+
+The installer is written to `release-client/ExpMon-Setup-<version>-x64.exe`. Desktop configuration, SSH profiles, run metadata, managed run files, and collector logs are stored under Electron's ExpMon user-data directory. Development builds can be checked end to end with `npm run test:desktop`.
+
 ## Managed Runs
 
 Launch an experiment through ExpMon:

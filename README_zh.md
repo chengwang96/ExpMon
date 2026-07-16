@@ -53,6 +53,24 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-expmon.ps1 -CollectorPo
 
 如果需要持久化前端或 collector 的环境变量覆盖项，可以把 `.env.example` 复制为本地 `.env` 文件。本地 `.env` 文件会被 Git 忽略。
 
+## Windows 桌面客户端
+
+Electron 客户端会打包生产版 React 界面和独立 Python collector sidecar。它会选择空闲的本机端口，用每次启动生成的 token 验证 renderer 请求，等待 collector 健康检查通过，并在窗口退出时清理整个 collector 进程树。安装后的客户端不需要用户另行安装 Python 或 Node.js。
+
+从仓库启动桌面客户端：
+
+```powershell
+npm run desktop:start
+```
+
+构建 Python sidecar 和 NSIS 安装包：
+
+```powershell
+npm run desktop:dist
+```
+
+安装包输出到 `release-client/ExpMon-Setup-<version>-x64.exe`。桌面配置、SSH profile、运行元数据、受管理运行文件和 collector 日志存放在 Electron 的 ExpMon 用户数据目录。可以运行 `npm run test:desktop` 对桌面客户端做端到端检查。
+
 ## 受管理的运行
 
 通过 ExpMon 启动实验：

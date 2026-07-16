@@ -1,8 +1,10 @@
 {
-  "name": "expmon-frontend",
+  "name": "expmon",
   "version": "0.1.0",
   "license": "MIT",
+  "author": "Cheng Wang",
   "description": "Local-first general experiment task monitor",
+  "main": "desktop/main.cjs",
   "type": "module",
   "repository": {
     "type": "git",
@@ -20,11 +22,21 @@
     "test:smoke": "python scripts/smoke.py",
     "test:ui": "python scripts/regression.py",
     "test:collector": "python scripts/collector_checks.py",
+    "test:desktop": "node scripts/desktop-smoke.cjs",
+    "test:desktop:syntax": "node --check desktop/main.cjs && node --check desktop/preload.cjs && node --check desktop/before-pack.cjs && node --check scripts/desktop-smoke.cjs",
     "test:privacy": "python scripts/privacy_scan.py",
-    "check:release": "npm run build && npm run test:collector && npm run test:privacy"
+    "desktop:start": "npm run build && electron .",
+    "desktop:sidecar": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-sidecar.ps1",
+    "desktop:pack": "npm run build && npm run desktop:sidecar && electron-builder --dir",
+    "desktop:dist": "npm run build && npm run desktop:sidecar && electron-builder --win nsis",
+    "check:release": "npm run build && npm run test:collector && npm run test:desktop:syntax && npm run test:privacy"
   },
-  "dependencies": {
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -32,8 +44,57 @@
     "typescript": "^5.7.2",
     "vite": "^6.0.7"
   },
-  "devDependencies": {
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3"
+  "build": {
+    "appId": "io.github.chengwang96.expmon",
+    "productName": "ExpMon",
+    "asar": true,
+    "electronDist": "node_modules/electron/dist",
+    "beforePack": "desktop/before-pack.cjs",
+    "directories": {
+      "output": "release-client"
+    },
+    "files": [
+      "dist/**/*",
+      "desktop/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/collector/expmon-collector",
+        "to": "collector"
+      },
+      {
+        "from": "scripts",
+        "to": "expmon/scripts",
+        "filter": [
+          "**/*.py"
+        ]
+      },
+      {
+        "from": "expmon.yaml",
+        "to": "expmon/expmon.yaml"
+      },
+      {
+        "from": "build/desktop/remote-package.json",
+        "to": "expmon/package.json"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "ExpMon-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   }
 }

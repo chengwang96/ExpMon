@@ -409,7 +409,29 @@ const initialRuns: Run[] = [];
 const REFRESH_INTERVAL_MS = 3000;
 const ALL_USERS = "__expmon_all_users__";
 const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env ?? {};
-const API_BASE = (VITE_ENV.VITE_COLLECTOR_URL ?? "http://127.0.0.1:5184").replace(/\/$/, "");
+type ExpMonDesktopBridge = {
+  collectorUrl: string;
+  apiToken: string;
+  platform: string;
+  version: string;
+};
+
+declare global {
+  interface Window {
+    expmonDesktop?: ExpMonDesktopBridge;
+  }
+}
+
+const DESKTOP_BRIDGE = window.expmonDesktop;
+const API_BASE = (DESKTOP_BRIDGE?.collectorUrl ?? VITE_ENV.VITE_COLLECTOR_URL ?? "http://127.0.0.1:5184").replace(/\/$/, "");
+const apiFetch = (input: RequestInfo | URL, init: RequestInit = {}) => {
+  if (!DESKTOP_BRIDGE?.apiToken) {
+    return fetch(input, init);
+  }
+  const headers = new Headers(init.headers);
+  headers.set("X-ExpMon-Token", DESKTOP_BRIDGE.apiToken);
+  return fetch(input, { ...init, headers });
+};
 
 const TEXT = {
   zh: {
@@ -936,7 +958,7 @@ function App() {
   }, []);
 
   const refreshSnapshot = useCallback(() => {
-    return fetch(`${API_BASE}/api/snapshot`, { cache: "no-store" })
+    return apiFetch(`${API_BASE}/api/snapshot`, { cache: "no-store" })
       .then((response) => {
         if (!response.ok) {
           throw new Error(`collector ${response.status}`);
@@ -1003,7 +1025,7 @@ function App() {
   const performKillRun = useCallback((run: Run) => {
     setKillInFlight(run.id);
     setOperationMessage(language === "zh" ? "正在终止任务..." : "Killing task...");
-    fetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}/kill`, {
+    apiFetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}/kill`, {
       method: "POST"
     })
       .then(async (response) => {
@@ -1052,7 +1074,7 @@ function App() {
         : current
     ));
     setOperationMessage(language === "zh" ? "任务记录已从列表移除，正在后台删除..." : "Run record hidden; deleting in the background...");
-    fetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}`, {
+    apiFetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}`, {
       method: "DELETE"
     })
       .then(async (response) => {
@@ -1096,7 +1118,7 @@ function App() {
   const saveSshServer = useCallback((form: SshServerForm): Promise<SshSaveResult> => {
     setSshSaveInFlight(true);
     setOperationMessage(language === "zh" ? "正在保存 SSH 服务器..." : "Saving SSH server...");
-    return fetch(`${API_BASE}/api/ssh/servers`, {
+    return apiFetch(`${API_BASE}/api/ssh/servers`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(form)
@@ -1143,7 +1165,7 @@ function App() {
       setSelectedHostId(snapshotRef.current.hosts[0]?.id ?? "local");
     }
     setOperationMessage(language === "zh" ? "SSH 服务器已从列表移除，正在后台删除..." : "SSH server hidden; deleting in the background...");
-    fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}`, {
+    apiFetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}`, {
       method: "DELETE"
     })
       .then(async (response) => {
@@ -1211,7 +1233,7 @@ function App() {
           setSelectedHostId(snapshotRef.current.hosts[0]?.id ?? "local");
         }
         setOperationMessage(language === "zh" ? "SSH 服务器已从列表清空，正在后台删除..." : "SSH servers hidden; clearing in the background...");
-        fetch(`${API_BASE}/api/ssh/servers`, { method: "DELETE" })
+        apiFetch(`${API_BASE}/api/ssh/servers`, { method: "DELETE" })
           .then(async (response) => {
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) {
@@ -1240,7 +1262,7 @@ function App() {
   const saveRunMetadata = useCallback((run: Run, patch: Partial<RunMetadata>) => {
     setMetadataSaveInFlight(run.id);
     setOperationMessage(language === "zh" ? "正在保存任务备注..." : "Saving run metadata...");
-    fetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}/metadata`, {
+    apiFetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}/metadata`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch)
@@ -1266,7 +1288,7 @@ function App() {
   const saveCollectorConfig = useCallback((config: CollectorConfig) => {
     setConfigSaveInFlight(true);
     setOperationMessage(language === "zh" ? "正在保存采集器配置..." : "Saving collector config...");
-    fetch(`${API_BASE}/api/config`, {
+    apiFetch(`${API_BASE}/api/config`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ config })
@@ -1317,7 +1339,7 @@ function App() {
       handleRemoteHostRefresh(hostFromSshServer(server, undefined, "initializing"), false);
     }
     const backgroundQuery = background ? "?background=1" : "";
-    fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/resources${backgroundQuery}`, {
+    apiFetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/resources${backgroundQuery}`, {
       method: "POST"
     })
       .then(async (response) => {
@@ -3101,7 +3123,7 @@ function ProjectsView({
     }
     setLoadingGit(true);
     setGitMessage(labels.loading);
-    fetch(`${API_BASE}/api/projects/${encodeURIComponent(selectedProject.id)}/git`, { cache: "no-store" })
+    apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(selectedProject.id)}/git`, { cache: "no-store" })
       .then(async (response) => {
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
@@ -3139,7 +3161,7 @@ function ProjectsView({
     }
     setLoadingGit(true);
     setGitMessage(action === "commit-message" ? labels.generateMessage : `${action}...`);
-    fetch(`${API_BASE}/api/projects/${encodeURIComponent(selectedProject.id)}/git/${action}`, {
+    apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(selectedProject.id)}/git/${action}`, {
       method: "POST"
     })
       .then(async (response) => {
@@ -3201,7 +3223,7 @@ function ProjectsView({
     }
     setLoadingGit(true);
     setGitMessage(labels.committing);
-    fetch(`${API_BASE}/api/projects/${encodeURIComponent(selectedProject.id)}/git/commit`, {
+    apiFetch(`${API_BASE}/api/projects/${encodeURIComponent(selectedProject.id)}/git/commit`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -3769,7 +3791,7 @@ function ExperimentLogsPanel({ run }: { run: Run }) {
     }
     setLoadingPreview(true);
     setMessage(labels.loading);
-    fetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}/visualizations/${encodeURIComponent(selected.id)}/preview`, {
+    apiFetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}/visualizations/${encodeURIComponent(selected.id)}/preview`, {
       cache: "no-store"
     })
       .then(async (response) => {
@@ -3809,7 +3831,7 @@ function ExperimentLogsPanel({ run }: { run: Run }) {
     }
     setOpeningViewer(true);
     setMessage(labels.starting);
-    fetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}/visualizations/${encodeURIComponent(selected.id)}/open`, {
+    apiFetch(`${API_BASE}/api/runs/${encodeURIComponent(run.id)}/visualizations/${encodeURIComponent(selected.id)}/open`, {
       method: "POST"
     })
       .then(async (response) => {
@@ -4279,7 +4301,7 @@ function SshServerPanel({
       ...current,
       [server.id]: { ok: false, message: t("testingSsh") }
     }));
-    return fetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/test`, {
+    return apiFetch(`${API_BASE}/api/ssh/servers/${encodeURIComponent(server.id)}/test`, {
       method: "POST"
     })
       .then(async (response) => {
