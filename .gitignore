@@ -1,6 +1,10 @@
 node_modules/
 dist/
 build/
+# Keep the generated brand icons in version control.
+!build/icon.ico
+!build/icon.png
+!build/icon.svg
 release/
 release-*/
 *.log

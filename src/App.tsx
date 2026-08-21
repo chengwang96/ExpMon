@@ -1,13 +1,18 @@
-﻿import {
+import {
   Activity,
   AlertTriangle,
   ArrowLeft,
   BarChart3,
+  Battery,
+  BatteryCharging,
+  BatteryFull,
   Cpu,
   Database,
   FileText,
   Gauge,
   HardDrive,
+  HeartPulse,
+  History,
   Layers3,
   ListFilter,
   MemoryStick,
@@ -46,6 +51,19 @@ import {
   useState,
   type MouseEvent
 } from "react";
+import {
+  dbAppend,
+  dbAvailable,
+  dbClear,
+  dbGetJson,
+  dbList,
+  dbSetJson,
+  dbStats,
+  HISTORY_KIND,
+  UI_KV,
+  type DbStats,
+  type ExpMonDesktopBridge
+} from "./desktop-db";
 
 type ResourceType = "cpu_only" | "gpu" | "hybrid" | "unknown";
 type RunStatus = "running" | "finished" | "failed" | "killed" | "unmanaged";
@@ -120,6 +138,70 @@ type GpuProcess = {
   project?: string;
   runName?: string;
   role?: string;
+};
+
+type HardwareSensor = {
+  id: string;
+  label: string;
+  type: string;
+  category: "power" | "temperature" | "electrical" | "cooling" | "system" | "other" | string;
+  group: string;
+  value: string;
+  numericValue: number | null;
+  unit: string;
+  source: string;
+};
+
+type PowerBatteryInfo = {
+  present: boolean;
+  supported?: boolean;
+  error?: string;
+  name?: string;
+  manufacturer?: string;
+  serialNumber?: string;
+  chemistry?: string;
+  designedCapacityWh?: number;
+  fullChargeCapacityWh?: number;
+  currentCapacityWh?: number;
+  cycleCount?: number;
+  healthPercent?: number;
+  chargePercent?: number;
+  status?: string;
+  voltageV?: number;
+  /** Positive = charging, negative = discharging. */
+  rateW?: number;
+};
+
+type HardwarePowerSnapshot = {
+  ok: boolean;
+  platform: string;
+  sampledAt: string;
+  source: string;
+  battery?: PowerBatteryInfo;
+  aida64: {
+    detected: boolean;
+    running: boolean;
+    processes: Array<{ pid: number; name: string; exe: string }>;
+    driverRunning: boolean;
+    sharedMemoryAvailable: boolean;
+    sharedMemoryName: string;
+    exportReady: boolean;
+    autoStartSupported: boolean;
+    autoStartAttempted: boolean;
+    autoStartSucceeded: boolean;
+    autoStartError: string;
+    executableFound: boolean;
+  };
+  summary: {
+    cpuPackageW: number | null;
+    gpuBoardW: number | null;
+    componentTotalW: number | null;
+    componentTotalComplete: boolean;
+    powerSensorCount: number;
+    sensorCount: number;
+    componentTotalScope: string;
+  };
+  sensors: HardwareSensor[];
 };
 
 type RunEvent = {
@@ -329,7 +411,7 @@ type GitProjectPayload = {
   error?: string;
 };
 
-type NavKey = "dashboard" | "hosts" | "projects" | "runs" | "detail" | "config" | "protocol";
+type NavKey = "dashboard" | "power" | "hosts" | "projects" | "runs" | "detail" | "config" | "protocol";
 
 type Snapshot = {
   hosts: Host[];
@@ -409,12 +491,6 @@ const initialRuns: Run[] = [];
 const REFRESH_INTERVAL_MS = 3000;
 const ALL_USERS = "__expmon_all_users__";
 const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env ?? {};
-type ExpMonDesktopBridge = {
-  collectorUrl: string;
-  apiToken: string;
-  platform: string;
-  version: string;
-};
 
 declare global {
   interface Window {
@@ -433,10 +509,146 @@ const apiFetch = (input: RequestInfo | URL, init: RequestInit = {}) => {
   return fetch(input, { ...init, headers });
 };
 
+// ---- Desktop history persistence helpers ---------------------------------
+// The Electron main process keeps a lightweight SQLite store under the app
+// data directory. These helpers compact live snapshots so that history and
+// UI state survive window refreshes and app restarts.
+
+const HISTORY_WRITE_INTERVAL_MS = 15000;
+const MAX_CACHED_HOSTS = 16;
+const MAX_CACHED_RUNS = 200;
+
+type CachedSnapshot = {
+  hosts: Host[];
+  runs: Run[];
+  projects?: Project[];
+  sshServers?: SshServer[];
+  cachedAt: string;
+};
+
+type StoredUiState = {
+  activeView?: NavKey;
+  selectedHostId?: string;
+  selectedRunId?: string;
+  query?: string;
+  resourceFilter?: ResourceType | "all";
+  userFilter?: string;
+  language?: Language;
+  savedAt?: string;
+};
+
+type HistoryEpisode = {
+  key: string;
+  kind: string;
+  recordedAt: string;
+  summary: string;
+  payload: unknown;
+};
+
+function compactHostForCache(host: Host): Host {
+  return {
+    ...host,
+    history: (host.history ?? []).slice(-60),
+    processes: undefined,
+    gpus: (host.gpus ?? []).slice(0, 32),
+  };
+}
+
+function compactRunForCache(run: Run): Run {
+  return {
+    ...run,
+    command: run.command.length > 500 ? `${run.command.slice(0, 500)}…` : run.command,
+    logs: run.logs.slice(-20),
+    metrics: run.metrics.slice(-60),
+    resources: run.resources.slice(-60),
+    events: (run.events ?? []).slice(-20),
+  };
+}
+
+function compactSnapshotForCache(snapshot: Snapshot): CachedSnapshot {
+  return {
+    hosts: snapshot.hosts.slice(0, MAX_CACHED_HOSTS).map(compactHostForCache),
+    runs: snapshot.runs.slice(0, MAX_CACHED_RUNS).map(compactRunForCache),
+    projects: snapshot.projects,
+    sshServers: snapshot.sshServers,
+    cachedAt: new Date().toISOString(),
+  };
+}
+
+function runHistoryFingerprint(runs: Run[]) {
+  return runs.map((run) => `${run.id}:${run.status}:${run.rootPid}:${run.endedAt ?? ""}`).join("|");
+}
+
+function desktopEvent(type: string, detail: Record<string, unknown>) {
+  dbAppend(HISTORY_KIND.event, { type, ...detail, at: new Date().toISOString() });
+}
+
+// Renders the snapshot content of one stored history episode.
+function EpisodeDetail({ episode }: { episode: HistoryEpisode }) {
+  const t = useT();
+  if (episode.kind === "host") {
+    const hosts = (episode.payload as { hosts?: Host[] }).hosts ?? [];
+    return (
+      <div className="db-episode-table">
+        {hosts.slice(0, 12).map((host) => (
+          <div key={host.id} className="db-episode-line">
+            <strong>{host.name}</strong>
+            <span>CPU {(host.cpuUsage ?? 0).toFixed(0)}% · MEM {(host.memoryUsedGb ?? 0).toFixed(1)}/{(host.memoryTotalGb ?? 0).toFixed(0)} GB · GPU {host.gpusBusy ?? 0}/{host.gpusTotal ?? 0} · {host.runningRuns ?? 0} runs</span>
+          </div>
+        ))}
+        {!hosts.length && <p className="db-restore-hint">{t("noEpisodes")}</p>}
+      </div>
+    );
+  }
+  if (episode.kind === "run") {
+    const runs = (episode.payload as { runs?: Run[] }).runs ?? [];
+    return (
+      <div className="db-episode-table">
+        {runs.slice(0, 12).map((run) => (
+          <div key={run.id} className="db-episode-line">
+            <strong>{run.project}/{run.name}</strong>
+            <span>{run.status} · PID {run.rootPid} · CPU {(run.cpuPercent ?? 0).toFixed(0)}% · MEM {(run.memoryGb ?? 0).toFixed(1)} GB</span>
+          </div>
+        ))}
+        {!runs.length && <p className="db-restore-hint">{t("noEpisodes")}</p>}
+      </div>
+    );
+  }
+  if (episode.kind === "power") {
+    const points = (episode.payload as { points?: PowerHistoryPoint[] }).points ?? [];
+    return (
+      <div className="db-episode-table">
+        {points.slice(-12).reverse().map((point, index) => (
+          <div key={index} className="db-episode-line">
+            <strong>{point.time}</strong>
+            <span>CPU {point.cpu != null ? `${point.cpu.toFixed(1)} W` : "-"} · GPU {point.gpu != null ? `${point.gpu.toFixed(1)} W` : "-"} · Σ {point.total != null ? `${point.total.toFixed(1)} W` : "-"}</span>
+          </div>
+        ))}
+        {!points.length && <p className="db-restore-hint">{t("noEpisodes")}</p>}
+      </div>
+    );
+  }
+  const fields = episode.payload as Record<string, unknown>;
+  return (
+    <div className="db-episode-table">
+      {Object.entries(fields)
+        .filter(([key]) => key !== "at")
+        .slice(0, 10)
+        .map(([key, value]) => (
+          <div key={key} className="db-episode-line">
+            <strong>{key}</strong>
+            <span>{typeof value === "object" && value !== null ? JSON.stringify(value) : String(value)}</span>
+          </div>
+        ))}
+    </div>
+  );
+}
+
 const TEXT = {
   zh: {
     appSubtitle: "通用实验任务监控系统",
     navDashboard: "资源总览",
+    navPower: "硬件功率",
     navHosts: "Host / SSH",
     navProjects: "项目",
     navRuns: "任务列表",
@@ -444,6 +656,7 @@ const TEXT = {
     navConfig: "配置",
     navProtocol: "协议模型",
     titleDashboard: "资源总览",
+    titlePower: "硬件功率与传感器",
     titleHosts: "Host / SSH 服务器",
     titleProjects: "项目",
     titleRuns: "实验任务",
@@ -456,6 +669,27 @@ const TEXT = {
     collectorLive: "采集器已连接",
     collectorOffline: "采集器未连接",
     refreshEvery: "每 3 秒刷新",
+    localHistory: "本地历史（SQLite）",
+    dbRows: "条记录",
+    dbEpisodes: "段连续记录",
+    clearLocalHistory: "清除本地历史",
+    dbClearConfirm: "确定要清除本地历史数据库（{count} 段记录）吗？界面状态会保留。",
+    dbHistoryRestored: "已从本地数据库恢复上次会话数据",
+    restoreDetails: "恢复详情",
+    restoredAtLabel: "恢复时间",
+    cachedHostsLabel: "缓存主机",
+    cachedRunsLabel: "缓存任务",
+    historyRowsLabel: "本地历史记录",
+    episodeHint: "同一会话内的连续采样合并为 1 段；中断超过 2 分钟才记为新的 1 段（操作事件按条计数）。",
+    chooseRecord: "选择历史记录查看",
+    snapshotHosts: "主机快照",
+    snapshotRuns: "任务快照",
+    snapshotPower: "功率历史",
+    eventLabel: "事件",
+    historicalSnapshot: "历史快照（非实时数据）",
+    noEpisodes: "暂无历史记录",
+    loadingEpisodes: "加载中…",
+    closeRestoreDetails: "关闭",
     language: "语言",
     chinese: "中文",
     english: "EN",
@@ -652,11 +886,61 @@ const TEXT = {
     logLevelOther: "其他",
     latestLogs: "最新日志",
     matchingLines: "匹配行",
-    noMatchingLogs: "没有匹配的日志"
+    noMatchingLogs: "没有匹配的日志",
+    powerAidaReady: "AIDA64 实时传感器",
+    powerAidaDetected: "已检测到 AIDA64",
+    powerAidaMissing: "未检测到 AIDA64",
+    powerAidaStarting: "正在后台启动 AIDA64",
+    powerAidaStartFailed: "AIDA64 自动启动失败",
+    powerSharedReady: "共享内存已连接",
+    powerSharedOff: "共享内存未开启",
+    powerFallback: "当前使用 NVIDIA 降级数据",
+    powerCpuPackage: "CPU Package",
+    powerGpuBoard: "GPU Board",
+    powerComponents: "已跟踪组件",
+    powerSensors: "活动传感器",
+    powerComplete: "CPU + GPU",
+    powerPartial: "仅部分组件",
+    powerScope: "组件功率不等于插座处的整机功耗；完整值为 CPU package 与独立 GPU board 的即时和。",
+    powerComposition: "功率构成",
+    powerHistory: "近期功率",
+    batteryPanel: "系统电池",
+    batteryCharge: "当前电量",
+    batteryCycleCount: "循环次数",
+    batteryTimes: "次",
+    batteryHealth: "电池健康度",
+    batteryHealthDetail: "满充 / 设计容量",
+    batteryDesignCapacity: "设计容量",
+    batteryWh: "Wh",
+    batteryFullCapacity: "满充容量",
+    batteryCurrentCapacity: "当前容量",
+    batteryVoltage: "电压",
+    batteryRate: "充放电速率",
+    batteryChemistry: "电池类型",
+    batteryManufacturer: "厂商 / 型号",
+    batterySerial: "序列号",
+    batteryStatusCharging: "充电中",
+    batteryStatusDischarging: "放电中",
+    batteryStatusFull: "已充满（接通电源）",
+    batteryStatusCritical: "电量严重不足",
+    batteryStatusIdle: "待机",
+    powerSensorReadings: "传感器读数",
+    powerEnableTitle: "开启 AIDA64 共享内存以读取完整数据",
+    powerEnableBody: "在 AIDA64 中依次打开 File > Preferences > Hardware Monitoring > External Applications，并勾选 Enable shared memory。ExpMon 会在下一次刷新时自动接入。",
+    powerNoData: "暂无功率数据",
+    powerNoDataBody: "ExpMon 会尝试在后台启动 AIDA64；请确认已开启共享内存，或确认 nvidia-smi 可用。",
+    powerLoading: "正在读取硬件传感器",
+    powerSource: "数据源",
+    powerLastSample: "最后采样",
+    powerSearchSensor: "搜索传感器或硬件分组",
+    powerDriver: "AIDA64 驱动",
+    powerRunning: "运行中",
+    powerStopped: "未运行"
   },
   en: {
     appSubtitle: "General experiment task monitor",
     navDashboard: "Resources",
+    navPower: "Hardware Power",
     navHosts: "Host / SSH",
     navProjects: "Projects",
     navRuns: "Runs",
@@ -664,6 +948,7 @@ const TEXT = {
     navConfig: "Config",
     navProtocol: "Protocol",
     titleDashboard: "Resource Dashboard",
+    titlePower: "Hardware Power & Sensors",
     titleHosts: "Host / SSH Servers",
     titleProjects: "Projects",
     titleRuns: "Experiment Runs",
@@ -676,6 +961,27 @@ const TEXT = {
     collectorLive: "collector connected",
     collectorOffline: "collector offline",
     refreshEvery: "refreshes every 3s",
+    localHistory: "Local history (SQLite)",
+    dbRows: "records",
+    dbEpisodes: "continuous episodes",
+    clearLocalHistory: "Clear local history",
+    dbClearConfirm: "Clear the local history database ({count} episodes)? UI state will be kept.",
+    dbHistoryRestored: "Restored last session data from the local database",
+    restoreDetails: "Restore details",
+    restoredAtLabel: "Restored at",
+    cachedHostsLabel: "Cached hosts",
+    cachedRunsLabel: "Cached runs",
+    historyRowsLabel: "Local history",
+    episodeHint: "Consecutive samples within one session merge into a single episode; a gap longer than 2 minutes starts a new one (action events count individually).",
+    chooseRecord: "Choose a record to view",
+    snapshotHosts: "Host snapshot",
+    snapshotRuns: "Run snapshot",
+    snapshotPower: "Power history",
+    eventLabel: "Event",
+    historicalSnapshot: "Historical snapshot — not live data",
+    noEpisodes: "No history records",
+    loadingEpisodes: "Loading…",
+    closeRestoreDetails: "Close",
     language: "Language",
     chinese: "中文",
     english: "EN",
@@ -872,7 +1178,56 @@ const TEXT = {
     logLevelOther: "Other",
     latestLogs: "Latest logs",
     matchingLines: "matching lines",
-    noMatchingLogs: "No matching logs"
+    noMatchingLogs: "No matching logs",
+    powerAidaReady: "AIDA64 live sensors",
+    powerAidaDetected: "AIDA64 detected",
+    powerAidaMissing: "AIDA64 not detected",
+    powerAidaStarting: "Starting AIDA64 in the background",
+    powerAidaStartFailed: "AIDA64 automatic start failed",
+    powerSharedReady: "shared memory connected",
+    powerSharedOff: "shared memory disabled",
+    powerFallback: "using NVIDIA fallback data",
+    powerCpuPackage: "CPU Package",
+    powerGpuBoard: "GPU Board",
+    powerComponents: "Tracked components",
+    powerSensors: "Active sensors",
+    powerComplete: "CPU + GPU",
+    powerPartial: "partial components",
+    powerScope: "Component power is not wall-plug system power. A complete reading is the instantaneous sum of CPU package and discrete GPU board power.",
+    powerComposition: "Power composition",
+    powerHistory: "Recent power",
+    batteryPanel: "System Battery",
+    batteryCharge: "Charge level",
+    batteryCycleCount: "Cycle count",
+    batteryTimes: "cycles",
+    batteryHealth: "Battery health",
+    batteryHealthDetail: "full / design capacity",
+    batteryDesignCapacity: "Design capacity",
+    batteryWh: "Wh",
+    batteryFullCapacity: "Full charge capacity",
+    batteryCurrentCapacity: "Current capacity",
+    batteryVoltage: "Voltage",
+    batteryRate: "Charge / discharge rate",
+    batteryChemistry: "Chemistry",
+    batteryManufacturer: "Manufacturer / model",
+    batterySerial: "Serial number",
+    batteryStatusCharging: "Charging",
+    batteryStatusDischarging: "Discharging",
+    batteryStatusFull: "Full (on AC)",
+    batteryStatusCritical: "Critical",
+    batteryStatusIdle: "Idle",
+    powerSensorReadings: "Sensor readings",
+    powerEnableTitle: "Enable AIDA64 shared memory for complete telemetry",
+    powerEnableBody: "In AIDA64, open File > Preferences > Hardware Monitoring > External Applications and enable shared memory. ExpMon connects automatically on the next refresh.",
+    powerNoData: "No power data",
+    powerNoDataBody: "ExpMon will try to start AIDA64 in the background. Make sure shared memory is enabled, or that nvidia-smi is available.",
+    powerLoading: "Reading hardware sensors",
+    powerSource: "Source",
+    powerLastSample: "Last sample",
+    powerSearchSensor: "Search sensors or hardware groups",
+    powerDriver: "AIDA64 driver",
+    powerRunning: "running",
+    powerStopped: "stopped"
   }
 } as const;
 
@@ -886,6 +1241,7 @@ const useT = () => {
 
 const navItems: Array<{ key: NavKey; labelKey: TextKey; icon: typeof Activity }> = [
   { key: "dashboard", labelKey: "navDashboard", icon: Gauge },
+  { key: "power", labelKey: "navPower", icon: Zap },
   { key: "hosts", labelKey: "navHosts", icon: Server },
   { key: "projects", labelKey: "navProjects", icon: Layers3 },
   { key: "runs", labelKey: "navRuns", icon: Workflow },
@@ -919,6 +1275,20 @@ function App() {
   const [metadataSaveInFlight, setMetadataSaveInFlight] = useState("");
   const [configSaveInFlight, setConfigSaveInFlight] = useState(false);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const [historyTotal, setHistoryTotal] = useState<number | null>(null);
+  const [restoredInfo, setRestoredInfo] = useState<{ cachedAt: string; hosts: number; runs: number } | null>(null);
+  const [showRestoreDetails, setShowRestoreDetails] = useState(false);
+  const [restoreStats, setRestoreStats] = useState<DbStats | null>(null);
+  const [historyEpisodes, setHistoryEpisodes] = useState<HistoryEpisode[] | null>(null);
+  const [expandedEpisode, setExpandedEpisode] = useState("");
+  const [powerSnapshot, setPowerSnapshot] = useState<HardwarePowerSnapshot | null>(null);
+  const [powerHistory, setPowerHistory] = useState<PowerHistoryPoint[]>([]);
+  const [powerError, setPowerError] = useState("");
+  const lastPowerSampledAtRef = useRef("");
+  const lastHostHistoryWriteRef = useRef(0);
+  const lastRunHistoryWriteRef = useRef(0);
+  const lastRunFingerprintRef = useRef("");
+  const restoreStartedRef = useRef(false);
   const snapshotRef = useRef(snapshot);
   const remoteHostsRef = useRef(remoteHosts);
   const optimisticDeletedRunIdsRef = useRef<Set<string>>(new Set());
@@ -957,6 +1327,345 @@ function App() {
     });
   }, []);
 
+  // Restore UI state and the last cached snapshot from the SQLite store on
+  // startup, so a refresh or restart shows the previous session immediately.
+  useEffect(() => {
+    if (restoreStartedRef.current || !dbAvailable()) {
+      return;
+    }
+    restoreStartedRef.current = true;
+    let cancelled = false;
+    void (async () => {
+      const [uiState, cached] = await Promise.all([
+        dbGetJson<StoredUiState>(UI_KV.uiState),
+        dbGetJson<CachedSnapshot>(UI_KV.lastSnapshot),
+      ]);
+      if (cancelled) {
+        return;
+      }
+      if (uiState) {
+        if (uiState.language === "zh" || uiState.language === "en") {
+          setLanguageState(uiState.language);
+        }
+        if (uiState.activeView) {
+          setActiveView(uiState.activeView);
+        }
+        if (uiState.selectedHostId) {
+          setSelectedHostId(uiState.selectedHostId);
+        }
+        if (uiState.selectedRunId) {
+          setSelectedRunId(uiState.selectedRunId);
+        }
+        if (typeof uiState.query === "string") {
+          setQuery(uiState.query);
+        }
+        if (uiState.resourceFilter) {
+          setResourceFilter(uiState.resourceFilter);
+        }
+        if (uiState.userFilter) {
+          setUserFilter(uiState.userFilter);
+        }
+      }
+      if (cached && (cached.hosts.length || cached.runs.length)) {
+        setSnapshot((current) => {
+          if (current.connected) {
+            return current;
+          }
+          return {
+            ...cached,
+            hosts: cached.hosts.length ? cached.hosts : current.hosts,
+            runs: cached.runs,
+            connected: false,
+          };
+        });
+        if (cached.runs.length) {
+          setSelectedRunId((current) => (
+            cached.runs.some((run) => run.id === current) ? current : cached.runs[0].id
+          ));
+        }
+        if (cached.hosts.length) {
+          setSelectedHostId((current) => (
+            cached.hosts.some((host) => host.id === current) ? current : cached.hosts[0].id
+          ));
+        }
+        setRestoredInfo({ cachedAt: cached.cachedAt, hosts: cached.hosts.length, runs: cached.runs.length });
+      }
+      const stats = await dbStats();
+      if (!cancelled && stats) {
+        setHistoryTotal(stats.episodesTotal ?? stats.total);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Persist UI state (debounced) so the next launch opens on the same view.
+  useEffect(() => {
+    if (!dbAvailable()) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void dbSetJson(UI_KV.uiState, {
+        activeView,
+        selectedHostId,
+        selectedRunId,
+        query,
+        resourceFilter,
+        userFilter,
+        language,
+        savedAt: new Date().toISOString(),
+      } satisfies StoredUiState);
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [activeView, language, query, resourceFilter, selectedHostId, selectedRunId, userFilter]);
+
+  // Keep the header history counter fresh.
+  useEffect(() => {
+    if (!dbAvailable()) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void dbStats().then((stats) => {
+        if (stats) {
+          setHistoryTotal(stats.episodesTotal ?? stats.total);
+        }
+      });
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  // Power sampling lives at the app level so it keeps collecting (and
+  // persisting) regardless of which view is in the foreground; the Hardware
+  // Power view is a pure presentation of this state. First, seed the chart
+  // with power history persisted in the SQLite store (previous sessions).
+  useEffect(() => {
+    let cancelled = false;
+    void dbList(HISTORY_KIND.power, { limit: 500 }).then((rows) => {
+      if (cancelled) {
+        return;
+      }
+      const persisted: PowerHistoryPoint[] = [];
+      for (const row of rows) {
+        try {
+          const point = JSON.parse(row.payload) as PowerHistoryPoint;
+          if (point && typeof point.sampledAt === "string" && typeof point.time === "string") {
+            persisted.push(point);
+          }
+        } catch {
+          // Skip malformed rows.
+        }
+      }
+      if (persisted.length) {
+        setPowerHistory((current) => {
+          const seen = new Set(current.map((point) => point.sampledAt));
+          const merged = [...persisted.filter((point) => !seen.has(point.sampledAt)), ...current];
+          return merged.slice(-120);
+        });
+        lastPowerSampledAtRef.current = persisted[persisted.length - 1]?.sampledAt ?? "";
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    const refreshPower = async () => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const response = await apiFetch(`${API_BASE}/api/hardware/power`, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const next = await response.json() as HardwarePowerSnapshot;
+        if (cancelled) {
+          return;
+        }
+        setPowerSnapshot(next);
+        setPowerError("");
+        const { cpuPackageW, gpuBoardW, componentTotalW, componentTotalComplete } = next.summary;
+        if (cpuPackageW !== null || gpuBoardW !== null) {
+          const point: PowerHistoryPoint = {
+            sampledAt: next.sampledAt,
+            time: new Date(next.sampledAt).toLocaleTimeString(language === "zh" ? "zh-CN" : "en-GB", {
+              hour12: false,
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit"
+            }),
+            cpu: cpuPackageW ?? undefined,
+            gpu: gpuBoardW ?? undefined,
+            total: componentTotalComplete ? componentTotalW ?? undefined : undefined
+          };
+          if (point.sampledAt !== lastPowerSampledAtRef.current) {
+            lastPowerSampledAtRef.current = point.sampledAt;
+            setPowerHistory((current) => [...current, point].slice(-120));
+            dbAppend(HISTORY_KIND.power, point);
+          }
+        }
+      } catch (requestError) {
+        if (!cancelled) {
+          setPowerError(requestError instanceof Error ? requestError.message : String(requestError));
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refreshPower();
+    const timer = window.setInterval(refreshPower, REFRESH_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [language]);
+
+  const clearLocalHistory = useCallback(() => {
+    if (historyTotal === null) {
+      return;
+    }
+    const message = t("dbClearConfirm").replace("{count}", String(historyTotal));
+    if (!window.confirm(message)) {
+      return;
+    }
+    void dbClear().then((ok) => {
+      if (ok) {
+        setHistoryTotal(0);
+        setRestoreStats((current) => (current ? { ...current, total: 0, kinds: [] } : current));
+      }
+    });
+  }, [historyTotal, t]);
+
+  // Loads the history browser entries (newest first) for the restore popover:
+  // every episode can be expanded to inspect that record's snapshot.
+  const loadHistoryEpisodes = useCallback(async () => {
+    const [hostRows, runRows, eventRows, powerRows, stats] = await Promise.all([
+      dbList(HISTORY_KIND.host, { limit: 30 }),
+      dbList(HISTORY_KIND.run, { limit: 30 }),
+      dbList(HISTORY_KIND.event, { limit: 30 }),
+      dbList(HISTORY_KIND.power, { limit: 120 }),
+      dbStats(),
+    ]);
+    const episodes: HistoryEpisode[] = [];
+    for (const row of hostRows) {
+      try {
+        const payload = JSON.parse(row.payload) as { at?: string; hosts?: Host[] };
+        const hosts = payload.hosts ?? [];
+        episodes.push({
+          key: `host:${row.id}`,
+          kind: "host",
+          recordedAt: row.recordedAt,
+          summary: `${t("snapshotHosts")} · ${hosts.length} ${t("host")}`,
+          payload,
+        });
+      } catch {
+        // Skip malformed rows.
+      }
+    }
+    for (const row of runRows) {
+      try {
+        const payload = JSON.parse(row.payload) as { at?: string; runs?: Run[] };
+        const runs = payload.runs ?? [];
+        episodes.push({
+          key: `run:${row.id}`,
+          kind: "run",
+          recordedAt: row.recordedAt,
+          summary: `${t("snapshotRuns")} · ${runs.length} ${t("status")}`,
+          payload,
+        });
+      } catch {
+        // Skip malformed rows.
+      }
+    }
+    for (const row of eventRows) {
+      try {
+        const payload = JSON.parse(row.payload) as Record<string, unknown> & { type?: string };
+        episodes.push({
+          key: `event:${row.id}`,
+          kind: "event",
+          recordedAt: row.recordedAt,
+          summary: `${t("eventLabel")} · ${payload.type ?? ""}`,
+          payload,
+        });
+      } catch {
+        // Skip malformed rows.
+      }
+    }
+    const powerPoints: PowerHistoryPoint[] = [];
+    let powerRecordedAt = "";
+    for (const row of powerRows) {
+      try {
+        const point = JSON.parse(row.payload) as PowerHistoryPoint;
+        if (point && typeof point.sampledAt === "string") {
+          powerPoints.push(point);
+          powerRecordedAt = row.recordedAt;
+        }
+      } catch {
+        // Skip malformed rows.
+      }
+    }
+    if (powerPoints.length) {
+      const powerCount = stats?.kinds.find((kind) => kind.kind === "power")?.count ?? powerPoints.length;
+      const powerEpisodes = stats?.kinds.find((kind) => kind.kind === "power")?.episodes ?? 1;
+      episodes.push({
+        key: "power:latest",
+        kind: "power",
+        recordedAt: powerRecordedAt,
+        summary: `${t("snapshotPower")} · ${powerCount} ${t("dbRows")} · ${powerEpisodes} ${t("dbEpisodes")}`,
+        payload: { points: powerPoints },
+      });
+    }
+    episodes.sort((left, right) => right.recordedAt.localeCompare(left.recordedAt));
+    setHistoryEpisodes(episodes.slice(0, 40));
+  }, [t]);
+
+  const toggleRestoreDetails = useCallback(() => {
+    setShowRestoreDetails((current) => {
+      const next = !current;
+      if (next) {
+        void dbStats().then((stats) => {
+          if (stats) {
+            setRestoreStats(stats);
+          }
+        });
+        void loadHistoryEpisodes();
+      }
+      return next;
+    });
+  }, [loadHistoryEpisodes]);
+
+  const scheduleHistoryWrites = useCallback((nextSnapshot: Snapshot) => {
+    if (!dbAvailable()) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastHostHistoryWriteRef.current >= HISTORY_WRITE_INTERVAL_MS) {
+      lastHostHistoryWriteRef.current = now;
+      dbAppend(HISTORY_KIND.host, {
+        at: new Date().toISOString(),
+        hosts: nextSnapshot.hosts.slice(0, MAX_CACHED_HOSTS).map(compactHostForCache),
+      });
+      void dbSetJson(UI_KV.lastSnapshot, compactSnapshotForCache(nextSnapshot));
+    }
+    const fingerprint = runHistoryFingerprint(nextSnapshot.runs);
+    if (
+      fingerprint !== lastRunFingerprintRef.current
+      || now - lastRunHistoryWriteRef.current >= HISTORY_WRITE_INTERVAL_MS
+    ) {
+      lastRunFingerprintRef.current = fingerprint;
+      lastRunHistoryWriteRef.current = now;
+      dbAppend(HISTORY_KIND.run, {
+        at: new Date().toISOString(),
+        runs: nextSnapshot.runs.slice(0, MAX_CACHED_RUNS).map(compactRunForCache),
+      });
+    }
+  }, []);
+
   const refreshSnapshot = useCallback(() => {
     return apiFetch(`${API_BASE}/api/snapshot`, { cache: "no-store" })
       .then((response) => {
@@ -989,6 +1698,7 @@ function App() {
         snapshotRef.current = nextSnapshot;
         setSnapshot(nextSnapshot);
         setLastRefreshAt(new Date());
+        scheduleHistoryWrites(nextSnapshot);
       })
       .catch((error: Error) => {
         setSnapshot((current) => ({
@@ -1038,6 +1748,7 @@ function App() {
       .then((payload) => {
         const total = (payload.terminated?.length ?? 0) + (payload.killed?.length ?? 0);
         setOperationMessage(language === "zh" ? `已向 ${total} 个进程发送终止信号` : `Kill signal sent to ${total} processes`);
+        desktopEvent("run.kill", { runId: run.id, project: run.project, name: run.name, processes: total });
         refreshSnapshot();
       })
       .catch((error: Error) => {
@@ -1087,6 +1798,7 @@ function App() {
       .then(() => {
         optimisticDeletedRunIdsRef.current.delete(run.id);
         setOperationMessage(language === "zh" ? "任务记录已删除" : "Run record deleted");
+        desktopEvent("run.delete", { runId: run.id, project: run.project, name: run.name });
         refreshSnapshot();
       })
       .catch((error: Error) => {
@@ -1139,6 +1851,7 @@ function App() {
       })
       .then((payload) => {
         setOperationMessage(language === "zh" ? "SSH 服务器已保存" : "SSH server saved");
+        desktopEvent("ssh.save", { serverId: payload.server?.id, name: payload.server?.name, host: payload.server?.host });
         if (payload.server) {
           handleRemoteHostRefresh(hostFromSshServer(payload.server, payload.test, payload.test?.ok ? "initializing" : "idle"));
         }
@@ -1177,6 +1890,7 @@ function App() {
       .then(() => {
         optimisticDeletedSshIdsRef.current.delete(server.id);
         setOperationMessage(language === "zh" ? "SSH 服务器已删除" : "SSH server deleted");
+        desktopEvent("ssh.delete", { serverId: server.id, name: server.name, host: server.host });
         refreshSnapshot();
       })
       .catch((error: Error) => {
@@ -1521,6 +2235,101 @@ function App() {
               <button className={language === "en" ? "active" : ""} onClick={() => setLanguage("en")}>EN</button>
               <button className={language === "zh" ? "active" : ""} onClick={() => setLanguage("zh")}>中文</button>
             </div>
+            {historyTotal !== null && (
+              <button
+                className="db-chip"
+                title={`${t("localHistory")}: ${historyTotal} ${t("dbEpisodes")} — ${t("clearLocalHistory")}`}
+                aria-label={t("clearLocalHistory")}
+                onClick={clearLocalHistory}
+              >
+                <Trash2 size={14} />
+                <span>{historyTotal}</span>
+              </button>
+            )}
+            {restoredInfo && (
+              <div className="db-restore-wrap">
+                <button
+                  className="db-restored-hint"
+                  title={t("dbHistoryRestored")}
+                  aria-label={t("dbHistoryRestored")}
+                  aria-expanded={showRestoreDetails}
+                  onClick={toggleRestoreDetails}
+                >
+                  <History size={13} />
+                </button>
+                {showRestoreDetails && (
+                  <>
+                    <div className="db-restore-overlay" onClick={() => setShowRestoreDetails(false)} />
+                    <div className="db-restore-popover" role="dialog" aria-label={t("restoreDetails")}>
+                      <div className="db-restore-title">
+                        <History size={13} />
+                        <span>{t("dbHistoryRestored")}</span>
+                      </div>
+                      <div className="db-restore-row">
+                        <span>{t("restoredAtLabel")}</span>
+                        <strong>{new Date(restoredInfo.cachedAt).toLocaleString(language === "zh" ? "zh-CN" : "en-GB", { hour12: false })}</strong>
+                      </div>
+                      <div className="db-restore-row">
+                        <span>{t("cachedHostsLabel")}</span>
+                        <strong>{restoredInfo.hosts}</strong>
+                      </div>
+                      <div className="db-restore-row">
+                        <span>{t("cachedRunsLabel")}</span>
+                        <strong>{restoredInfo.runs}</strong>
+                      </div>
+                      <div className="db-restore-divider" />
+                      <div className="db-restore-row">
+                        <span>{t("historyRowsLabel")}</span>
+                        <strong>{restoreStats?.episodesTotal ?? historyTotal ?? 0} {t("dbEpisodes")}</strong>
+                      </div>
+                      {(restoreStats?.kinds ?? []).map((kind) => (
+                        <div key={kind.kind} className="db-restore-row db-restore-kind">
+                          <span>{kind.kind}{kind.count !== kind.episodes ? ` · ${kind.count} ${t("dbRows")}` : ""}</span>
+                          <strong>{kind.episodes ?? kind.count} {t("dbEpisodes")}</strong>
+                        </div>
+                      ))}
+                      <p className="db-restore-hint">{t("episodeHint")}</p>
+                      <div className="db-restore-divider" />
+                      <div className="db-restore-title">
+                        <History size={13} />
+                        <span>{t("chooseRecord")}</span>
+                      </div>
+                      <div className="db-episode-list">
+                        {(historyEpisodes ?? []).map((episode) => (
+                          <div key={episode.key} className="db-episode-item">
+                            <button
+                              className="db-episode-row"
+                              aria-expanded={expandedEpisode === episode.key}
+                              onClick={() => setExpandedEpisode((current) => (current === episode.key ? "" : episode.key))}
+                            >
+                              <span className="db-episode-time">
+                                {new Date(episode.recordedAt).toLocaleString(language === "zh" ? "zh-CN" : "en-GB", { hour12: false })}
+                              </span>
+                              <span className="db-episode-summary">{episode.summary}</span>
+                            </button>
+                            {expandedEpisode === episode.key && (
+                              <div className="db-episode-detail">
+                                <p className="db-restore-hint">{t("historicalSnapshot")}</p>
+                                <EpisodeDetail episode={episode} />
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                        {historyEpisodes !== null && historyEpisodes.length === 0 && (
+                          <p className="db-restore-hint">{t("noEpisodes")}</p>
+                        )}
+                        {historyEpisodes === null && (
+                          <p className="db-restore-hint">{t("loadingEpisodes")}</p>
+                        )}
+                      </div>
+                      <button className="db-restore-close" onClick={() => setShowRestoreDetails(false)}>
+                        {t("closeRestoreDetails")}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
             <button
               className={`icon-button refresh-button${manualRefreshInFlight ? " is-refreshing" : ""}`}
               title={t("refresh")}
@@ -1550,6 +2359,9 @@ function App() {
               setActiveView("detail");
             }}
           />
+        )}
+        {activeView === "power" && (
+          <HardwarePowerView snapshot={powerSnapshot} history={powerHistory} error={powerError} />
         )}
         {activeView === "hosts" && (
           <HostsView
@@ -1707,6 +2519,8 @@ function viewTitle(view: NavKey, t: (key: TextKey) => string) {
   switch (view) {
     case "dashboard":
       return t("titleDashboard");
+    case "power":
+      return t("titlePower");
     case "hosts":
       return t("titleHosts");
     case "projects":
@@ -2045,6 +2859,329 @@ function usePersistentCardOrder<T>(
   }), [dragOverId, draggingId, storageKey]);
 
   return { orderedItems, dragPropsFor };
+}
+
+type PowerHistoryPoint = {
+  sampledAt: string;
+  time: string;
+  cpu?: number;
+  gpu?: number;
+  total?: number;
+};
+
+function HardwarePowerView({
+  snapshot,
+  history,
+  error,
+}: {
+  snapshot: HardwarePowerSnapshot | null;
+  history: PowerHistoryPoint[];
+  error: string;
+}) {
+  const t = useT();
+  const language = useContext(I18nContext);
+  const [sensorQuery, setSensorQuery] = useState("");
+
+  const sensors = useMemo(() => {
+    const query = sensorQuery.trim().toLocaleLowerCase();
+    if (!query) {
+      return snapshot?.sensors ?? [];
+    }
+    return (snapshot?.sensors ?? []).filter((sensor) => (
+      `${sensor.label} ${sensor.id} ${sensor.group} ${sensor.category}`.toLocaleLowerCase().includes(query)
+    ));
+  }, [sensorQuery, snapshot?.sensors]);
+
+  const sensorGroups = useMemo(() => {
+    const order = ["power", "temperature", "electrical", "cooling", "system", "other"];
+    const grouped = new Map<string, HardwareSensor[]>();
+    sensors.forEach((sensor) => {
+      const rows = grouped.get(sensor.category) ?? [];
+      rows.push(sensor);
+      grouped.set(sensor.category, rows);
+    });
+    return order
+      .filter((category) => grouped.has(category))
+      .map((category) => ({ category, sensors: grouped.get(category) ?? [] }));
+  }, [sensors]);
+
+  const summary = snapshot?.summary;
+  const aida64 = snapshot?.aida64;
+  const statusClass = aida64?.exportReady ? "ready" : (aida64?.detected || aida64?.autoStartSucceeded) ? "warning" : "muted";
+  const statusTitle = aida64?.exportReady
+    ? t("powerAidaReady")
+    : aida64?.detected
+      ? t("powerAidaDetected")
+      : aida64?.autoStartError
+        ? t("powerAidaStartFailed")
+        : aida64?.autoStartSucceeded
+          ? t("powerAidaStarting")
+      : t("powerAidaMissing");
+  const statusDetail = aida64?.exportReady
+    ? t("powerSharedReady")
+    : aida64?.detected
+      ? `${t("powerSharedOff")} · ${snapshot?.sensors.length ? t("powerFallback") : t("powerNoData")}`
+      : aida64?.autoStartError
+        ? aida64.autoStartError
+      : snapshot?.sensors.length
+        ? t("powerFallback")
+        : t("powerNoDataBody");
+  const cpuPower = summary?.cpuPackageW ?? null;
+  const gpuPower = summary?.gpuBoardW ?? null;
+  const componentTotal = summary?.componentTotalW ?? null;
+  const compositionTotal = Math.max((cpuPower ?? 0) + (gpuPower ?? 0), 0.001);
+  const battery = snapshot?.battery;
+  const batteryStatusLabel = battery?.status === "charging"
+    ? t("batteryStatusCharging")
+    : battery?.status === "discharging"
+      ? t("batteryStatusDischarging")
+      : battery?.status === "full"
+        ? t("batteryStatusFull")
+        : battery?.status === "critical"
+          ? t("batteryStatusCritical")
+          : t("batteryStatusIdle");
+
+  return (
+    <section className="view-stack power-view">
+      <div className={`panel power-status-panel ${statusClass}`}>
+        <div className="power-status-icon"><Zap size={21} /></div>
+        <div className="power-status-copy">
+          <strong>{snapshot ? statusTitle : t("powerLoading")}</strong>
+          <span>{error ? `${t("collectorOffline")}: ${error}` : statusDetail}</span>
+        </div>
+        <div className="power-status-meta">
+          <span>{t("powerDriver")}</span>
+          <strong>{aida64?.driverRunning ? t("powerRunning") : t("powerStopped")}</strong>
+        </div>
+        <div className="power-status-meta">
+          <span>{t("powerLastSample")}</span>
+          <strong>{snapshot?.sampledAt ? formatClock(new Date(snapshot.sampledAt)) : "-"}</strong>
+        </div>
+      </div>
+
+      <div className="metric-grid power-metric-grid">
+        <HardwarePowerMetric icon={Cpu} label={t("powerCpuPackage")} value={formatHardwarePower(cpuPower)} detail={aida64?.exportReady ? "AIDA64" : "-"} accent="cyan" />
+        <HardwarePowerMetric icon={Zap} label={t("powerGpuBoard")} value={formatHardwarePower(gpuPower)} detail={snapshot?.source === "nvidia-smi" ? "nvidia-smi" : aida64?.exportReady ? "AIDA64" : "-"} accent="blue" />
+        <HardwarePowerMetric
+          icon={Activity}
+          label={t("powerComponents")}
+          value={formatHardwarePower(componentTotal)}
+          detail={summary?.componentTotalComplete ? t("powerComplete") : t("powerPartial")}
+          accent="amber"
+        />
+        <HardwarePowerMetric icon={Gauge} label={t("powerSensors")} value={summary?.sensorCount ?? 0} detail={`${summary?.powerSensorCount ?? 0} W`} accent="green" />
+      </div>
+
+      {battery && battery.present && (
+        <div className="panel power-battery-panel">
+          <PanelTitle icon={Battery} title={t("batteryPanel")} />
+          <div className="metric-grid power-metric-grid">
+            <HardwarePowerMetric
+              icon={BatteryCharging}
+              label={t("batteryCharge")}
+              value={battery.chargePercent != null ? `${battery.chargePercent.toFixed(0)}%` : "-"}
+              detail={batteryStatusLabel}
+              accent="green"
+            />
+            <HardwarePowerMetric
+              icon={RefreshCw}
+              label={t("batteryCycleCount")}
+              value={battery.cycleCount != null ? String(battery.cycleCount) : "-"}
+              detail={t("batteryTimes")}
+              accent="cyan"
+            />
+            <HardwarePowerMetric
+              icon={HeartPulse}
+              label={t("batteryHealth")}
+              value={battery.healthPercent != null ? `${battery.healthPercent.toFixed(0)}%` : "-"}
+              detail={t("batteryHealthDetail")}
+              accent="amber"
+            />
+            <HardwarePowerMetric
+              icon={BatteryFull}
+              label={t("batteryDesignCapacity")}
+              value={battery.designedCapacityWh != null ? `${battery.designedCapacityWh.toFixed(1)} Wh` : "-"}
+              detail={t("batteryWh")}
+              accent="blue"
+            />
+          </div>
+          <div className="power-battery-details">
+            <div><span>{t("batteryFullCapacity")}</span><strong>{battery.fullChargeCapacityWh != null ? `${battery.fullChargeCapacityWh.toFixed(1)} Wh` : "-"}</strong></div>
+            <div><span>{t("batteryCurrentCapacity")}</span><strong>{battery.currentCapacityWh != null ? `${battery.currentCapacityWh.toFixed(1)} Wh` : "-"}</strong></div>
+            <div><span>{t("batteryVoltage")}</span><strong>{battery.voltageV != null ? `${battery.voltageV.toFixed(2)} V` : "-"}</strong></div>
+            <div><span>{t("batteryRate")}</span><strong>{battery.rateW != null ? `${battery.rateW > 0 ? "+" : ""}${battery.rateW.toFixed(1)} W` : "-"}</strong></div>
+            <div><span>{t("batteryChemistry")}</span><strong>{battery.chemistry || "-"}</strong></div>
+            <div><span>{t("batteryManufacturer")}</span><strong>{battery.manufacturer || battery.name || "-"}</strong></div>
+            {battery.serialNumber && (
+              <div><span>{t("batterySerial")}</span><strong>{battery.serialNumber}</strong></div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="power-analysis-grid">
+        <div className="panel power-composition-panel">
+          <PanelTitle icon={Zap} title={t("powerComposition")} />
+          {(cpuPower !== null || gpuPower !== null) ? (
+            <>
+              <div className="power-composition-total">
+                <strong>{formatHardwarePower(componentTotal)}</strong>
+                <span>{summary?.componentTotalComplete ? t("powerComplete") : t("powerPartial")}</span>
+              </div>
+              <div className="power-composition-bar" aria-label={t("powerComposition")}>
+                {cpuPower !== null && <span className="cpu" style={{ width: `${(cpuPower / compositionTotal) * 100}%` }} />}
+                {gpuPower !== null && <span className="gpu" style={{ width: `${(gpuPower / compositionTotal) * 100}%` }} />}
+              </div>
+              <div className="power-composition-key">
+                <div><i className="cpu" /><span>{t("powerCpuPackage")}</span><strong>{formatHardwarePower(cpuPower)}</strong></div>
+                <div><i className="gpu" /><span>{t("powerGpuBoard")}</span><strong>{formatHardwarePower(gpuPower)}</strong></div>
+              </div>
+              <p className="power-scope-note">{t("powerScope")}</p>
+            </>
+          ) : (
+            <EmptyPanel title={t("powerNoData")} body={t("powerNoDataBody")} />
+          )}
+        </div>
+
+        <div className="panel power-history-panel">
+          <PanelTitle icon={Activity} title={t("powerHistory")} />
+          {history.length ? (
+            <div className="power-history-chart">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={history} margin={{ top: 8, right: 12, bottom: 0, left: -16 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(113, 128, 150, 0.18)" />
+                  <XAxis dataKey="time" minTickGap={30} tick={{ fontSize: 11, fill: "#64748b" }} />
+                  <YAxis unit=" W" tick={{ fontSize: 11, fill: "#64748b" }} width={64} />
+                  <Tooltip formatter={(value) => `${Number(value).toFixed(1)} W`} />
+                  <Legend />
+                  <Line type="monotone" dataKey="cpu" name={t("powerCpuPackage")} stroke="#138a7e" strokeWidth={2.2} dot={false} connectNulls />
+                  <Line type="monotone" dataKey="gpu" name={t("powerGpuBoard")} stroke="#4169d8" strokeWidth={2.2} dot={false} connectNulls />
+                  <Line type="monotone" dataKey="total" name={t("powerComponents")} stroke="#b66d16" strokeWidth={2.4} dot={false} connectNulls />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <EmptyPanel title={t("powerLoading")} body={t("powerNoDataBody")} />
+          )}
+        </div>
+      </div>
+
+      {aida64?.detected && !aida64.exportReady && (
+        <div className="panel power-setup-panel">
+          <div className="power-setup-index">01</div>
+          <div>
+            <strong>{t("powerEnableTitle")}</strong>
+            <p>{t("powerEnableBody")}</p>
+          </div>
+          <code>File &gt; Preferences &gt; Hardware Monitoring &gt; External Applications</code>
+        </div>
+      )}
+
+      <div className="power-sensor-heading">
+        <div>
+          <h2>{t("powerSensorReadings")}</h2>
+          <span>{t("powerSource")}: {hardwarePowerSourceLabel(snapshot?.source, language)}</span>
+        </div>
+        <label className="power-sensor-search">
+          <Search size={15} />
+          <input value={sensorQuery} onChange={(event) => setSensorQuery(event.target.value)} placeholder={t("powerSearchSensor")} />
+        </label>
+      </div>
+
+      {sensorGroups.length ? (
+        <div className="power-sensor-grid">
+          {sensorGroups.map((group) => (
+            <HardwareSensorPanel key={group.category} category={group.category} sensors={group.sensors} language={language} />
+          ))}
+        </div>
+      ) : (
+        <div className="panel"><EmptyPanel title={t("powerNoData")} body={t("powerNoDataBody")} /></div>
+      )}
+    </section>
+  );
+}
+
+function HardwarePowerMetric({
+  icon: Icon,
+  label,
+  value,
+  detail,
+  accent
+}: {
+  icon: typeof Activity;
+  label: string;
+  value: string | number;
+  detail: string;
+  accent: string;
+}) {
+  return (
+    <div className={`metric-card power-metric-card ${accent}`}>
+      <Icon size={19} />
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </div>
+  );
+}
+
+function HardwareSensorPanel({
+  category,
+  sensors,
+  language
+}: {
+  category: string;
+  sensors: HardwareSensor[];
+  language: Language;
+}) {
+  return (
+    <div className={`panel power-sensor-panel ${category}`}>
+      <div className="power-sensor-panel-head">
+        <strong>{hardwareSensorCategoryLabel(category, language)}</strong>
+        <span>{sensors.length}</span>
+      </div>
+      <div className="power-sensor-table">
+        {sensors.map((sensor) => (
+          <div className="power-sensor-row" key={`${category}-${sensor.id}`}>
+            <div>
+              <strong>{sensor.label}</strong>
+              <span>{sensor.group} · {sensor.id}</span>
+            </div>
+            <em>{sensor.value}{sensor.unit ? ` ${sensor.unit === "C" ? "°C" : sensor.unit}` : ""}</em>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatHardwarePower(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "-";
+  }
+  return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} W`;
+}
+
+function hardwarePowerSourceLabel(source: string | undefined, language: Language) {
+  if (source === "aida64-shared-memory") {
+    return language === "zh" ? "AIDA64 共享内存" : "AIDA64 shared memory";
+  }
+  if (source === "nvidia-smi") {
+    return language === "zh" ? "nvidia-smi（降级）" : "nvidia-smi fallback";
+  }
+  return language === "zh" ? "系统" : "System";
+}
+
+function hardwareSensorCategoryLabel(category: string, language: Language) {
+  const labels: Record<string, [string, string]> = {
+    power: ["功率", "Power"],
+    temperature: ["温度", "Temperature"],
+    electrical: ["电压与电流", "Voltage & current"],
+    cooling: ["散热", "Cooling"],
+    system: ["系统状态", "System"],
+    other: ["其他", "Other"]
+  };
+  const label = labels[category] ?? labels.other;
+  return language === "zh" ? label[0] : label[1];
 }
 
 function Dashboard({

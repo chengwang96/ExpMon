@@ -37,6 +37,12 @@ _截图使用隐私安全的演示数据，可以通过 `npm run screenshots:rea
 
 ![ExpMon 实验任务列表](docs/images/expmon-runs.png)
 
+### 通过 AIDA64 查看丰富的本机功率数据
+
+**硬件功率** 页面会自动检测 AIDA64；若尚未运行，ExpMon 会查找已安装或曾运行过的便携版，并通过 `/SILENT` 在后台启动。开启 AIDA64 共享内存后，ExpMon 可展示 CPU package 与子域功率、GPU board 与供电轨功率、温度、电压、电流、风扇及其他导出的传感器。共享内存未开启时，页面仍会通过 `nvidia-smi` 降级展示 NVIDIA GPU 功率和温度。
+
+首次使用仍需在 **AIDA64 > File > Preferences > Hardware Monitoring > External Applications > Enable shared memory** 开启共享内存；此后无需手动打开 AIDA64。便携版无法被自动定位时，可通过 `EXPMON_AIDA64_PATH` 指定 `aida64.exe`。页面中的 CPU + GPU 组件功率并不等于插座处测得的整机功耗。
+
 ## 快速开始
 
 ### Windows 桌面客户端

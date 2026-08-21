@@ -37,6 +37,12 @@ Filter work by user and resource type, distinguish running, finished, and failed
 
 ![ExpMon experiment runs](docs/images/expmon-runs.png)
 
+### Rich local power telemetry with AIDA64
+
+The **Hardware Power** page automatically detects AIDA64. If it is not running, ExpMon locates an installed or previously run portable copy and starts it in the background with `/SILENT`. When AIDA64 shared memory is enabled, ExpMon displays CPU package and subdomain power, GPU board and rail power, temperatures, voltages, currents, fans, and other exported sensors. Without shared memory, the page remains usable with NVIDIA GPU power and temperature from `nvidia-smi`.
+
+Shared memory still needs to be enabled once in **AIDA64 > File > Preferences > Hardware Monitoring > External Applications > Enable shared memory**; subsequent launches do not require opening AIDA64 manually. Set `EXPMON_AIDA64_PATH` to `aida64.exe` when a portable copy cannot be located automatically. Reported CPU + GPU component power is not wall-plug whole-system power.
+
 ## Get Started
 
 ### Windows desktop client
@@ -58,6 +64,12 @@ npm run desktop:dist
 The installer is written to `release-client/ExpMon-Setup-<version>-x64.exe`. Installed builds bundle the React UI and Python collector, choose a free loopback port, authenticate local API requests with a per-launch token, and clean up the collector process tree on exit. Users do not need a separate Python or Node.js installation.
 
 Desktop configuration, SSH profiles, run metadata, managed runs, and collector logs live in Electron's ExpMon user-data directory.
+
+The desktop client also keeps a lightweight SQLite history database (`expmon-history.db` in the same user-data directory, built on Node's bundled `node:sqlite` — no extra native modules). It survives window refreshes and app restarts:
+
+- **UI state** — last view, selected host/run, search and filter settings are restored on launch.
+- **Cached snapshot** — the last dashboard state (hosts, runs, SSH servers) is shown immediately while the collector starts, even when it is offline.
+- **Sampled history** — host/run samples are recorded as *episodes*: all consecutive samples within one continuous session merge into a single record, and a gap longer than 2 minutes starts the next one (power keeps one row per sample for the chart and counts episodes the same way; action events count individually). A header badge shows the episode count; click it to clear the local history (UI state is kept), and the restore button next to it shows restore details.
 
 ### Browser development mode
 

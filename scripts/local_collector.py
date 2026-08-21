@@ -26,6 +26,9 @@ from urllib.request import Request, urlopen
 
 import psutil
 
+from aida64_sensors import hardware_power_payload
+from battery_info import battery_payload
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - PyYAML is listed in the project docs, but keep collector resilient.
@@ -4629,9 +4632,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self.ensure_authorized():
             return
+        try:
+            self._dispatch_get()
+        except Exception as exc:  # keep the API alive; surface errors to the client
+            self.log_error("GET %s failed: %s", urlparse(self.path).path, exc)
+            self.send_json({"ok": False, "error": str(exc)}, status=500)
+
+    def _dispatch_get(self) -> None:
         path = urlparse(self.path).path
         if path == "/api/snapshot":
             self.send_json(snapshot())
+            return
+        if path == "/api/hardware/power":
+            power_payload = hardware_power_payload(gpu_samples())
+            try:
+                power_payload["battery"] = battery_payload()
+            except Exception as exc:  # battery info must never break the power endpoint
+                power_payload["battery"] = {"present": False, "supported": False, "error": str(exc)}
+            self.send_json(power_payload)
             return
         if path == "/api/ssh/servers":
             self.send_json(ssh_servers_payload())

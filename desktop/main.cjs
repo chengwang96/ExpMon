@@ -1,9 +1,10 @@
-const { app, BrowserWindow, dialog, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const { spawn, spawnSync } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
+const { createStore, isValidKind } = require("./store.cjs");
 
 const SOURCE_ROOT = path.resolve(__dirname, "..");
 if (process.env.EXPMON_DESKTOP_DATA_DIR) {
@@ -13,6 +14,57 @@ let collectorProcess = null;
 let collectorLog = null;
 let mainWindow = null;
 let quitting = false;
+let historyStore = null;
+
+function openHistoryStore() {
+  if (historyStore) {
+    return historyStore;
+  }
+  historyStore = createStore(path.join(desktopDataDir(), "expmon-history.db"));
+  return historyStore;
+}
+
+function registerHistoryIpc() {
+  const kvKeyPattern = /^[a-z0-9_.-]{1,120}$/i;
+  ipcMain.handle("expmon:db:get", (_event, key) => {
+    if (typeof key !== "string" || !kvKeyPattern.test(key)) {
+      throw new Error("invalid kv key");
+    }
+    return openHistoryStore().getKv(key);
+  });
+  ipcMain.handle("expmon:db:set", (_event, key, value) => {
+    if (typeof key !== "string" || !kvKeyPattern.test(key)) {
+      throw new Error("invalid kv key");
+    }
+    if (typeof value !== "string" || value.length > 512 * 1024) {
+      throw new Error("invalid kv value");
+    }
+    openHistoryStore().setKv(key, value);
+    return true;
+  });
+  ipcMain.handle("expmon:db:append", (_event, kind, payload) => {
+    if (typeof kind !== "string" || !isValidKind(kind)) {
+      throw new Error("invalid history kind");
+    }
+    if (typeof payload !== "string" || payload.length > 512 * 1024) {
+      throw new Error("invalid history payload");
+    }
+    return openHistoryStore().append(kind, payload);
+  });
+  ipcMain.handle("expmon:db:list", (_event, kind, options) => {
+    if (typeof kind !== "string" || !isValidKind(kind)) {
+      throw new Error("invalid history kind");
+    }
+    return openHistoryStore().list(kind, options);
+  });
+  ipcMain.handle("expmon:db:clear", (_event, kind) => {
+    if (kind != null && (typeof kind !== "string" || !isValidKind(kind))) {
+      throw new Error("invalid history kind");
+    }
+    return openHistoryStore().clear(kind);
+  });
+  ipcMain.handle("expmon:db:stats", () => openHistoryStore().stats());
+}
 
 function existingPath(candidates) {
   return candidates.find((candidate) => candidate && fs.existsSync(candidate));
@@ -182,7 +234,10 @@ async function runSmokeCapture(window, collectorUrl, logPath) {
       return {
         bridgeReady: Boolean(bridge?.collectorUrl && bridge?.apiToken),
         collectorConnected: document.body.innerText.includes("collector connected"),
-        healthStatus
+        healthStatus,
+        dbChipText: [...document.querySelectorAll(".db-chip")].map((button) => button.textContent.trim()).join(","),
+        dbRestoredHint: Boolean(document.querySelector(".db-restored-hint")),
+        pageTitle: document.querySelector("h1")?.textContent?.trim() ?? "",
       };
     })()`);
     if (rendererState.collectorConnected && rendererState.healthStatus === 200) {
@@ -211,6 +266,23 @@ async function runSmokeCapture(window, collectorUrl, logPath) {
       target?.click();
     })()`);
   }
+  // Open the restore details popover and report the record browser state.
+  await window.webContents.executeJavaScript(`(() => {
+    document.querySelector(".db-restored-hint")?.click();
+  })()`);
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const restoreListState = await window.webContents.executeJavaScript(`(() => {
+    const items = [...document.querySelectorAll(".db-episode-item")];
+    const loading = Boolean(document.querySelector(".db-restore-popover")?.textContent.includes("Loading"));
+    const empty = [...document.querySelectorAll(".db-restore-popover p")].some((node) => node.textContent.trim().startsWith("No history"));
+    return {
+      popoverOpen: Boolean(document.querySelector(".db-restore-popover")),
+      episodeItems: items.length,
+      episodeLoading: loading,
+      episodeEmpty: empty,
+      episodeSummaries: items.map((item) => item.querySelector(".db-episode-summary")?.textContent?.trim() ?? "").slice(0, 6),
+    };
+  })()`);
   const settleMs = Number(process.env.EXPMON_DESKTOP_SMOKE_SETTLE_MS || 0);
   if (settleMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, settleMs));
@@ -225,12 +297,14 @@ async function runSmokeCapture(window, collectorUrl, logPath) {
     collectorLog: logPath,
     smokeView,
     ...rendererState,
+    ...restoreListState,
   }, null, 2));
   app.quit();
 }
 
 async function createMainWindow() {
   const { collectorUrl, token, logPath } = await startCollector();
+  const windowIcon = existingPath([path.join(SOURCE_ROOT, "build", "icon.ico")]);
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -240,6 +314,7 @@ async function createMainWindow() {
     autoHideMenuBar: true,
     backgroundColor: "#f6f8f8",
     title: "ExpMon",
+    ...(windowIcon ? { icon: windowIcon } : {}),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -285,7 +360,11 @@ if (!hasSingleInstanceLock) {
       mainWindow.focus();
     }
   });
-  app.whenReady().then(createMainWindow).catch((error) => {
+  app.whenReady().then(() => {
+    openHistoryStore();
+    registerHistoryIpc();
+    return createMainWindow();
+  }).catch((error) => {
     dialog.showErrorBox("ExpMon could not start", error instanceof Error ? error.message : String(error));
     app.quit();
   });
@@ -294,6 +373,8 @@ if (!hasSingleInstanceLock) {
 app.on("before-quit", () => {
   quitting = true;
   stopCollector();
+  historyStore?.close();
+  historyStore = null;
 });
 
 app.on("window-all-closed", () => app.quit());

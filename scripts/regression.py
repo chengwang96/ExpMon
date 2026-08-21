@@ -9,8 +9,8 @@ def note(message: str) -> None:
     print(message)
 
 
-def click_nav(page, index: int) -> None:
-    page.locator("nav.nav-list button").nth(index).click()
+def click_nav(page, name: str) -> None:
+    page.locator("nav.nav-list").get_by_role("button", name=name, exact=True).click()
     page.wait_for_load_state("domcontentloaded")
 
 
@@ -117,14 +117,20 @@ def main() -> None:
         expect(refresh_button).to_have_class(re.compile(r"\bis-refreshing\b"))
         note("PASS: manual refresh animation state")
 
-        page.get_by_role("button", name="中文").click()
+        page.get_by_role("button", name="中文", exact=True).click()
         expect(page.get_by_role("heading", name="资源总览")).to_be_visible()
         expect(page.get_by_text("Resource Dashboard")).to_have_count(0)
-        page.get_by_role("button", name="EN").click()
+        page.get_by_role("button", name="EN", exact=True).click()
         expect(page.get_by_role("heading", name="Resource Dashboard")).to_be_visible()
         note("PASS: language toggle")
 
-        click_nav(page, 3)
+        click_nav(page, "Hardware Power")
+        expect(page.get_by_role("heading", name="Hardware Power & Sensors")).to_be_visible()
+        expect(page.locator(".power-metric-card")).to_have_count(4)
+        expect(page.locator(".power-status-panel")).to_be_visible()
+        note("PASS: hardware power telemetry page")
+
+        click_nav(page, "Runs")
         expect(page.get_by_role("button", name="CPU-only", exact=True)).to_be_visible()
         run_rows = page.locator(".run-table-row")
         if run_rows.count() == 0:
@@ -166,7 +172,7 @@ def main() -> None:
                 page.wait_for_selector(".confirm-dialog", state="detached", timeout=3000)
                 note("PASS: delete run confirmation")
 
-        click_nav(page, 2)
+        click_nav(page, "Projects")
         expect(page.get_by_role("heading", name="Projects")).to_be_visible()
         push_buttons = page.locator("button:has-text('Git push')")
         if push_buttons.count() == 0 or push_buttons.first.is_disabled():
@@ -179,7 +185,7 @@ def main() -> None:
             page.wait_for_selector(".confirm-dialog", state="detached", timeout=3000)
             note("PASS: Git push confirmation")
 
-        click_nav(page, 1)
+        click_nav(page, "Host / SSH")
         expect(page.get_by_role("heading", name="Host / SSH Servers")).to_be_visible()
         if page.get_by_role("button", name="Test Connection").count() > 0:
             expect(page.get_by_role("button", name="Refresh Resources")).to_have_count(0)
@@ -187,7 +193,7 @@ def main() -> None:
         else:
             note("SKIP: SSH test action, no remote SSH server configured")
 
-        click_nav(page, 4)
+        click_nav(page, "Config")
         expect(page.get_by_role("heading", name="Config", exact=True)).to_be_visible()
         host_input = page.locator("label", has_text="Host ID").locator("input")
         original_host = host_input.input_value()
@@ -213,7 +219,7 @@ def main() -> None:
         note("PASS: config save round-trip")
 
         page.set_viewport_size({"width": 390, "height": 900})
-        click_nav(page, 0)
+        click_nav(page, "Resources")
         expect(page.get_by_role("heading", name="Resource Dashboard")).to_be_visible()
         note("PASS: mobile dashboard renders")
 

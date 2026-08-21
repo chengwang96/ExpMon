@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 import expmon
+import aida64_sensors
 import local_collector
 
 
@@ -15,6 +16,26 @@ def main() -> None:
     original_api_token = local_collector.API_TOKEN
     original_snapshot_fixture_path = local_collector.SNAPSHOT_FIXTURE_PATH
     try:
+        ansi_payload = (
+            "<pwr><id>PCPUPKG</id><label>CPU Package</label><value>48.36</value></pwr>"
+            "<pwr><id>PGPU1</id><label>GPU</label><value>11.40</value></pwr>"
+            "<pwr><id>PGPU112VHPWR</id><label>GPU 12VHPWR</label><value>10.20</value></pwr>"
+            "<curr><id>CGPU112VHPWR</id><label>GPU 12VHPWR</label><value>0.51</value></curr>"
+            "<volt><id>VGPU112VHPWR</id><label>GPU 12VHPWR</label><value>20.00</value></volt>"
+            "<temp><id>TGPU1</id><label>GPU</label><value>47</value></temp>"
+        )
+        assert aida64_sensors.decode_aida64_buffer(ansi_payload.encode("ascii") + b"\x00ignored") == ansi_payload
+        utf16_payload = ansi_payload.encode("utf-16-le") + b"\x00\x00"
+        assert aida64_sensors.decode_aida64_buffer(utf16_payload) == ansi_payload
+        parsed_sensors = aida64_sensors.parse_aida64_sensor_payload(ansi_payload)
+        assert len(parsed_sensors) == 6, parsed_sensors
+        power_summary = aida64_sensors.summarize_power_sensors(parsed_sensors)
+        assert power_summary["cpuPackageW"] == 48.36, power_summary
+        assert power_summary["gpuBoardW"] == 11.4, power_summary
+        assert power_summary["componentTotalW"] == 59.76, power_summary
+        assert power_summary["componentTotalComplete"] is True, power_summary
+        assert power_summary["powerSensorCount"] == 3, power_summary
+
         local_collector.API_TOKEN = ""
         assert local_collector.api_request_authorized(None)
         local_collector.API_TOKEN = "desktop-secret"
@@ -24,6 +45,11 @@ def main() -> None:
 
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
+            fake_aida64 = workspace / "aida64.exe"
+            fake_aida64.touch()
+            assert aida64_sensors._executable_candidate(fake_aida64) == fake_aida64.resolve()
+            assert aida64_sensors._executable_candidate(f'"{fake_aida64}",0') == fake_aida64.resolve()
+
             fixture_path = workspace / "snapshot.json"
             fixture_path.write_text(
                 '{"hosts":[{"id":"ssh:demo"}],"runs":[{"id":"run-1","hostId":"ssh:demo"}],'
