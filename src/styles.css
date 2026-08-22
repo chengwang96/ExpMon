@@ -3785,6 +3785,23 @@ body.is-card-dragging * {
   white-space: nowrap;
 }
 
+.power-sensor-row.temp-warm em {
+  color: var(--amber);
+}
+
+.power-sensor-row.temp-hot em {
+  color: var(--danger);
+}
+
+.power-sensor-row.temp-hot {
+  background: rgba(196, 61, 61, 0.05);
+  border-left: 3px solid var(--danger);
+}
+
+.power-sensor-row.temp-warm {
+  border-left: 3px solid var(--amber);
+}
+
 @media (max-width: 1180px) {
   .app-shell {
     grid-template-columns: 82px minmax(0, 1fr);

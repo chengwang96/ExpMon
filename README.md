@@ -61,7 +61,7 @@ Build the standalone Python sidecar and Windows installer:
 npm run desktop:dist
 ```
 
-The installer is written to `release-client/ExpMon-Setup-<version>-x64.exe`. Installed builds bundle the React UI and Python collector, choose a free loopback port, authenticate local API requests with a per-launch token, and clean up the collector process tree on exit. Users do not need a separate Python or Node.js installation.
+The installer is written to the user's Documents folder (`Documents/ExpMon-release/ExpMon-Setup-<version>-x64.exe`). Installed builds bundle the React UI and Python collector, choose a free loopback port, authenticate local API requests with a per-launch token, and clean up the collector process tree on exit. Users do not need a separate Python or Node.js installation.
 
 Desktop configuration, SSH profiles, run metadata, managed runs, and collector logs live in Electron's ExpMon user-data directory.
 

@@ -28,8 +28,8 @@
     "desktop:start": "npm run build && electron .",
     "desktop:icons": "powershell -ExecutionPolicy Bypass -File scripts/generate-icons.ps1",
     "desktop:sidecar": "powershell -ExecutionPolicy Bypass -File scripts/build-desktop-sidecar.ps1",
-    "desktop:pack": "npm run build && npm run desktop:icons && npm run desktop:sidecar && electron-builder --dir",
-    "desktop:dist": "npm run build && npm run desktop:icons && npm run desktop:sidecar && electron-builder --win nsis",
+    "desktop:pack": "npm run build && npm run desktop:icons && npm run desktop:sidecar && electron-builder --dir --config.directories.output=\"%USERPROFILE%\\Documents\\ExpMon-release\"",
+    "desktop:dist": "npm run build && npm run desktop:icons && npm run desktop:sidecar && electron-builder --win nsis --config.directories.output=\"%USERPROFILE%\\Documents\\ExpMon-release\"",
     "screenshots:readme": "npm run build && node scripts/capture-readme-screenshots.cjs",
     "check:release": "npm run build && npm run test:collector && npm run test:desktop:syntax && npm run test:privacy"
   },

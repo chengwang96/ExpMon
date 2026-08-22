@@ -489,6 +489,9 @@ const timeline = ["15:31", "15:36", "15:41", "15:46", "15:51", "15:56", "16:01",
 const initialRuns: Run[] = [];
 
 const REFRESH_INTERVAL_MS = 3000;
+// Temperature sensor color thresholds (degrees Celsius).
+const WARM_TEMPERATURE_C = 70;
+const HIGH_TEMPERATURE_C = 85;
 const ALL_USERS = "__expmon_all_users__";
 const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env ?? {};
 
@@ -3124,6 +3127,23 @@ function HardwarePowerMetric({
   );
 }
 
+function hardwareTemperatureLevel(sensor: HardwareSensor): "hot" | "warm" | "normal" {
+  if (sensor.category !== "temperature") {
+    return "normal";
+  }
+  const value = sensor.numericValue;
+  if (value == null || !Number.isFinite(value)) {
+    return "normal";
+  }
+  if (value >= HIGH_TEMPERATURE_C) {
+    return "hot";
+  }
+  if (value >= WARM_TEMPERATURE_C) {
+    return "warm";
+  }
+  return "normal";
+}
+
 function HardwareSensorPanel({
   category,
   sensors,
@@ -3140,15 +3160,23 @@ function HardwareSensorPanel({
         <span>{sensors.length}</span>
       </div>
       <div className="power-sensor-table">
-        {sensors.map((sensor) => (
-          <div className="power-sensor-row" key={`${category}-${sensor.id}`}>
-            <div>
-              <strong>{sensor.label}</strong>
-              <span>{sensor.group} · {sensor.id}</span>
+        {sensors.map((sensor) => {
+          const level = hardwareTemperatureLevel(sensor);
+          const levelTitle = level === "hot"
+            ? (language === "zh" ? "温度过高" : "High temperature")
+            : level === "warm"
+              ? (language === "zh" ? "温度偏高" : "Warm")
+              : undefined;
+          return (
+            <div className={`power-sensor-row${level !== "normal" ? ` temp-${level}` : ""}`} key={`${category}-${sensor.id}`}>
+              <div>
+                <strong>{sensor.label}</strong>
+                <span>{sensor.group} · {sensor.id}</span>
+              </div>
+              <em title={levelTitle}>{sensor.value}{sensor.unit ? ` ${sensor.unit === "C" ? "°C" : sensor.unit}` : ""}</em>
             </div>
-            <em>{sensor.value}{sensor.unit ? ` ${sensor.unit === "C" ? "°C" : sensor.unit}` : ""}</em>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
