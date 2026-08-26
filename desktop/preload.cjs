@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld("expmonDesktop", Object.freeze({
   apiToken: argumentValue("expmon-api-token"),
   version: argumentValue("expmon-version"),
   platform: process.platform,
+  // Native folder picker (used by the directory-monitoring UI).
+  pickDirectory: () => ipcRenderer.invoke("expmon:pick-directory"),
   // Lightweight SQLite-backed history store (main process).
   db: Object.freeze({
     get: (key) => ipcRenderer.invoke("expmon:db:get", key),

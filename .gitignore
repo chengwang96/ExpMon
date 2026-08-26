@@ -30,5 +30,8 @@ wandb/
 mlruns/
 screenshots/
 
+# Machine-specific launchers (contain absolute local paths).
+ExpMon.launch.vbs
+
 .DS_Store
 Thumbs.db

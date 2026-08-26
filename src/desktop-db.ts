@@ -45,6 +45,7 @@ export type ExpMonDesktopBridge = {
   platform: string;
   version: string;
   db?: DesktopDbApi;
+  pickDirectory?: () => Promise<{ canceled: boolean; path?: string }>;
 };
 
 export const HISTORY_KIND = {

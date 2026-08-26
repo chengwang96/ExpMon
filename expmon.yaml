@@ -38,3 +38,19 @@ protocol:
   manifest_cache_seconds: 3
   max_scan_depth: 5
   max_metric_points: 120
+
+# Whole-project output directory monitoring (see README "Output Directory Monitoring").
+# Recognition results are confirmed from the Projects page and stored here automatically.
+project_monitoring:
+  dirs: []
+  #   - path: D:/projects/my-experiments/results
+  #     enabled: true
+  #     recognition:
+  #       runs: []
+  llm:
+    enabled: false            # only effective when an API key is configured (or local ollama/opencode)
+    provider: openai-compatible  # openai-compatible | openai | deepseek | anthropic | ollama | opencode
+    base_url: ""              # blank = provider default
+    model: ""                 # blank = provider default
+    api_key: ""               # direct value or env:VAR_NAME; falls back to the provider env var
+    timeout_seconds: 60

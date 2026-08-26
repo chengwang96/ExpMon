@@ -66,6 +66,18 @@ function registerHistoryIpc() {
   ipcMain.handle("expmon:db:stats", () => openHistoryStore().stats());
 }
 
+function registerDialogIpc() {
+  ipcMain.handle("expmon:pick-directory", async () => {
+    const owner = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const options = {
+      title: "Select project directory",
+      properties: ["openDirectory", "createDirectory"],
+    };
+    const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    return result.canceled ? { canceled: true } : { canceled: false, path: result.filePaths[0] || "" };
+  });
+}
+
 function existingPath(candidates) {
   return candidates.find((candidate) => candidate && fs.existsSync(candidate));
 }
@@ -363,6 +375,7 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(() => {
     openHistoryStore();
     registerHistoryIpc();
+    registerDialogIpc();
     return createMainWindow();
   }).catch((error) => {
     dialog.showErrorBox("ExpMon could not start", error instanceof Error ? error.message : String(error));

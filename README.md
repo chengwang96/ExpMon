@@ -152,6 +152,23 @@ Useful environment variables:
 - `EXPMON_SSH_SERVERS`: local SSH server profile storage path.
 - `EXPMON_RUN_METADATA`: local run notes and marks storage path.
 
+## Output Directory Monitoring
+
+The **Projects** page can monitor whole project directories whose run outputs already exist — including tasks that finished before ExpMon started. Click **Add monitored directory**, enter the project path, and scan:
+
+1. ExpMon walks the directory and proposes a recognized task per output scope: log files (`*.log`, `nohup.out`, `stdout/stderr`, …), metric files (JSONL, CSV, TensorBoard events, W&B offline runs, MLflow), and — for plain logs — a regex suggestion (e.g. `epoch=(\d+) ... loss=([\d.]+)`) with a live preview of extracted rows.
+2. Confirm or correct each proposal (run name, log files, metric format, regex fields), then save. The confirmed format is stored in the collector config and applied to new output automatically.
+3. Recognized runs appear on the **Runs** and **Projects** pages with status, log tail, and metric curves; runs whose log file is being written are shown as `running`, and error markers in the tail (traceback, CUDA OOM, …) mark a run `failed`.
+
+### Optional LLM-assisted recognition
+
+When the directory layout is unclear (no obvious logs/metrics), an optional LLM can analyze the directory tree and propose runs and formats. Configure it on the **Config** page under *Directory recognition LLM*:
+
+- Providers: `openai-compatible` (any OpenAI-compatible endpoint), `openai`, `deepseek`, `anthropic`, `ollama`, `opencode`.
+- The LLM is **enabled only when an API key is configured** (or for local `ollama` / `opencode` servers, which need no key); without configuration, plain automatic recognition is always used.
+- API keys can be entered directly or referenced as `env:VAR_NAME`; each provider falls back to its standard environment variable (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`).
+- **Test LLM connection** verifies the endpoint before scanning.
+
 ## Host / SSH
 
 The **Host / SSH** page shows local host resources and stores remote SSH server profiles in a gitignored local file. Key-based SSH profiles can be tested from the UI with the local `ssh` command.

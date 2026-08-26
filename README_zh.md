@@ -146,6 +146,23 @@ pip install mlflow
 - `EXPMON_SSH_SERVERS`：本地 SSH 服务器配置存储路径。
 - `EXPMON_RUN_METADATA`：本地运行笔记和标记存储路径。
 
+## 输出目录监控
+
+**项目** 页面可以监控整个项目目录中已经存在的运行输出——包括在 ExpMon 启动之前就已经跑完的任务。点击 **添加监控目录**，输入项目路径并扫描：
+
+1. ExpMon 会遍历目录，为每一处任务输出给出识别建议：日志文件（`*.log`、`nohup.out`、`stdout/stderr` 等）、指标文件（JSONL、CSV、TensorBoard events、W&B offline runs、MLflow），以及纯文本日志的正则建议（例如 `epoch=(\d+) ... loss=([\d.]+)`），并附带提取行的实时预览。
+2. 确认或修正每个建议（任务名称、日志文件、指标格式、正则字段）后保存。确认后的格式会写入 collector 配置，并自动应用到后续新产生的输出。
+3. 识别出的任务会出现在 **任务列表** 和 **项目** 页面，包含状态、日志尾部和指标曲线；日志文件仍在写入的任务显示为 `running`，日志尾部出现错误标记（traceback、CUDA OOM 等）的任务标记为 `failed`。
+
+### 可选的 LLM 辅助识别
+
+当目录结构不清晰（找不到明显的日志/指标文件）时，可以启用可选 LLM 分析目录树并给出任务与格式建议。在 **配置** 页面的 *目录识别 LLM* 中设置：
+
+- 支持 Provider：`openai-compatible`（任意 OpenAI 兼容端点）、`openai`、`deepseek`、`anthropic`、`ollama`、`opencode`。
+- **只有配置了 API Key 后 LLM 才会启用**（本地 `ollama` / `opencode` 服务无需 Key）；未配置时始终使用纯自动识别。
+- API Key 可以直接填写，也可以用 `env:变量名` 引用；各 Provider 会自动回退到标准环境变量（`OPENAI_API_KEY`、`DEEPSEEK_API_KEY`、`ANTHROPIC_API_KEY`）。
+- **测试 LLM 连接** 可以在扫描前验证端点是否可用。
+
 ## Host / SSH
 
 **Host / SSH** 页面会显示本地主机资源，并把远程 SSH 服务器配置存储在一个被 Git 忽略的本地文件中。基于密钥的 SSH 配置可以在 UI 中通过本地 `ssh` 命令测试。

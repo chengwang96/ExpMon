@@ -47,6 +47,9 @@ SKIP_FILES = {
     "expmon-run-metadata.json",
     "expmon-ssh-servers.json",
     "scripts/privacy_scan.py",
+    # Machine-specific launcher kept out of git; it necessarily contains the
+    # local checkout path (see .gitignore).
+    "ExpMon.launch.vbs",
 }
 
 PATTERNS = {

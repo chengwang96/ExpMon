@@ -133,6 +133,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_scan_depth": 5,
         "max_metric_points": 120,
     },
+    "project_monitoring": {
+        "dirs": [],
+        "llm": {
+            "enabled": False,
+            "provider": "openai-compatible",
+            "base_url": "",
+            "model": "",
+            "api_key": "",
+            "timeout_seconds": 60,
+        },
+    },
 }
 
 RUNNER_NAME_HINTS = (
@@ -236,10 +247,66 @@ def config_metadata() -> dict[str, Any]:
     }
 
 
+def normalize_recognition_run(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+    name = str(item.get("name") or "").strip()
+    scope = str(item.get("scope") or "").strip()
+    logs = string_list(item.get("logs"))
+    normalized = {
+        "name": name,
+        "scope": scope,
+        "logs": logs,
+        "metrics": {
+            "kind": str(metrics.get("kind") or "none").strip() or "none",
+            "path": str(metrics.get("path") or "").strip(),
+            "pattern": str(metrics.get("pattern") or "").strip(),
+            "fields": string_list(metrics.get("fields")),
+        },
+        "status": str(item.get("status") or "").strip(),
+    }
+    if name or scope or logs or normalized["metrics"]["kind"] != "none":
+        return normalized
+    return None
+
+
+def normalize_monitored_dir(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    path_text = str(item.get("path") or "").strip()
+    if not path_text:
+        return None
+    recognition = item.get("recognition") if isinstance(item.get("recognition"), dict) else {}
+    runs = [run for run in (normalize_recognition_run(entry) for entry in recognition.get("runs") or []) if run]
+    return {
+        "path": path_text,
+        "enabled": bool(item.get("enabled", True)),
+        "project": str(item.get("project") or "").strip(),
+        "resource_type": str(item.get("resource_type") or "").strip(),
+        "recognition": {"runs": runs},
+    }
+
+
+def normalize_llm_config(raw: dict[str, Any]) -> dict[str, Any]:
+    provider = str(raw.get("provider") or "openai-compatible").strip() or "openai-compatible"
+    if provider not in LLM_PRESETS:
+        provider = "openai-compatible"
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "provider": provider,
+        "base_url": str(raw.get("base_url") or "").strip(),
+        "model": str(raw.get("model") or "").strip(),
+        "api_key": str(raw.get("api_key") or "").strip(),
+        "timeout_seconds": int_setting(raw.get("timeout_seconds"), 60, 5, 600),
+    }
+
+
 def normalize_collector_config(raw: dict[str, Any]) -> dict[str, Any]:
     sampling = raw.get("sampling") if isinstance(raw.get("sampling"), dict) else {}
     discovery = raw.get("run_discovery") if isinstance(raw.get("run_discovery"), dict) else {}
     protocol = raw.get("protocol") if isinstance(raw.get("protocol"), dict) else {}
+    monitoring = raw.get("project_monitoring") if isinstance(raw.get("project_monitoring"), dict) else {}
     explicit_rules: list[dict[str, str]] = []
     for rule in discovery.get("explicit_rules") or []:
         if not isinstance(rule, dict):
@@ -269,6 +336,14 @@ def normalize_collector_config(raw: dict[str, Any]) -> dict[str, Any]:
             "manifest_cache_seconds": int_setting(protocol.get("manifest_cache_seconds"), 3, 1, 3600),
             "max_scan_depth": int_setting(protocol.get("max_scan_depth"), 5, 1, 25),
             "max_metric_points": int_setting(protocol.get("max_metric_points"), 120, 10, 10000),
+        },
+        "project_monitoring": {
+            "dirs": [
+                directory
+                for directory in (normalize_monitored_dir(item) for item in monitoring.get("dirs") or [])
+                if directory
+            ],
+            "llm": normalize_llm_config(monitoring.get("llm") if isinstance(monitoring.get("llm"), dict) else {}),
         },
     }
 
@@ -3656,6 +3731,11 @@ def project_path_for_run(run: dict[str, Any]) -> Path | None:
     cwd = str(run.get("cwd") or "")
     if not cwd:
         return None
+    if run.get("source") == "directory" and str(run.get("monitoredDir") or ""):
+        try:
+            return Path(str(run["monitoredDir"])).resolve()
+        except OSError:
+            pass
     project_name = str(run.get("project") or "").strip()
     try:
         cwd_path = Path(cwd).resolve()
@@ -4455,6 +4535,761 @@ def runtime_from_status(status_doc: dict[str, Any], started_at: str) -> int:
         return 0
 
 
+# ---------------------------------------------------------------------------
+# Project directory monitoring
+# ---------------------------------------------------------------------------
+# Users can register whole project directories. The collector scans them for
+# task outputs (log files, metric files, TensorBoard/W&B/MLflow dirs), proposes
+# a recognized format per detected run, and — when heuristics are not enough —
+# can ask an optional LLM (OpenAI-compatible / Anthropic / Ollama / opencode)
+# to identify logs and formats. The user confirms the proposal once; confirmed
+# runs (including already-finished ones) then appear on the Runs page.
+
+LLM_PRESETS: dict[str, dict[str, Any]] = {
+    "openai": {"base_url": "https://api.openai.com/v1", "env": "OPENAI_API_KEY", "model": "gpt-4o-mini", "key_required": True},
+    "deepseek": {"base_url": "https://api.deepseek.com/v1", "env": "DEEPSEEK_API_KEY", "model": "deepseek-chat", "key_required": True},
+    "anthropic": {"base_url": "https://api.anthropic.com", "env": "ANTHROPIC_API_KEY", "model": "claude-3-5-haiku-latest", "key_required": True},
+    "ollama": {"base_url": "http://127.0.0.1:11434/v1", "env": "", "model": "", "key_required": False},
+    "opencode": {"base_url": "http://127.0.0.1:4096/v1", "env": "", "model": "", "key_required": False},
+    "openai-compatible": {"base_url": "", "env": "", "model": "", "key_required": True},
+}
+
+MONITORING_NOISE_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", ".env",
+    ".ipynb_checkpoints", ".idea", ".vscode", "wandb", "mlruns",
+}
+MONITORING_LOG_NAME_HINTS = ("log", "nohup", "stdout", "stderr", "output", "train", "run")
+MONITORING_LOG_SKIP_EXTENSIONS = (
+    ".py", ".json", ".yaml", ".yml", ".png", ".jpg", ".jpeg", ".svg", ".gif",
+    ".pth", ".pt", ".ckpt", ".safetensors", ".csv", ".jsonl", ".pdf", ".md",
+    ".ipynb", ".parquet", ".npy", ".npz",
+)
+MONITORING_METRIC_NAME_HINTS = ("metric", "history", "progress", "result", "loss", "score", "eval")
+MONITORING_ERROR_MARKERS = (
+    "traceback (most recent call last)",
+    "cuda out of memory",
+    "outofmemoryerror",
+    "runtimeerror",
+    "error:",
+    "nan loss",
+    "process killed",
+)
+MONITORING_SCAN_MAX_DEPTH = 6
+MONITORING_SCAN_MAX_CANDIDATES = 50
+MONITORING_RUN_TTL_SECONDS = 15
+MONITORING_RUNNING_WINDOW_SECONDS = 600
+
+DIRECTORY_RUNS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def monitoring_config() -> dict[str, Any]:
+    value = CONFIG.get("project_monitoring")
+    return value if isinstance(value, dict) else {}
+
+
+def llm_config() -> dict[str, Any]:
+    value = monitoring_config().get("llm")
+    return value if isinstance(value, dict) else {}
+
+
+def resolve_llm_api_key(llm: dict[str, Any]) -> str:
+    raw = str(llm.get("api_key") or "").strip()
+    if raw.startswith("env:"):
+        return os.environ.get(raw[4:].strip(), "")
+    provider = str(llm.get("provider") or "openai-compatible")
+    preset_env = str(LLM_PRESETS.get(provider, {}).get("env") or "")
+    if not raw and preset_env:
+        raw = os.environ.get(preset_env, "")
+    return raw
+
+
+def llm_effective_enabled(llm: dict[str, Any]) -> bool:
+    if not llm.get("enabled"):
+        return False
+    provider = str(llm.get("provider") or "openai-compatible")
+    preset = LLM_PRESETS.get(provider, LLM_PRESETS["openai-compatible"])
+    if not preset.get("key_required"):
+        return True
+    return bool(resolve_llm_api_key(llm))
+
+
+def tail_bytes(path: Path, limit_bytes: int = 262144) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - limit_bytes))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def tail_lines_fast(path: Path, limit: int = 80) -> list[str]:
+    text = tail_bytes(path)
+    if not text:
+        return []
+    return text.splitlines()[-limit:]
+
+
+def safe_relative_path(root: Path, relative: str) -> Path | None:
+    if not relative:
+        return None
+    candidate = (root / relative).resolve()
+    root_resolved = root.resolve()
+    if candidate != root_resolved and not str(candidate).startswith(str(root_resolved) + os.sep):
+        return None
+    return candidate
+
+
+def looks_like_log_file(name: str) -> bool:
+    lower = name.lower()
+    if lower.endswith((".log", ".out", ".err")):
+        return True
+    if lower.endswith(MONITORING_LOG_SKIP_EXTENSIONS):
+        return False
+    return any(hint in lower for hint in MONITORING_LOG_NAME_HINTS)
+
+
+def looks_like_metric_file(name: str) -> bool:
+    lower = name.lower()
+    if lower.endswith(".jsonl") and "wandb" not in lower:
+        return True
+    if lower.endswith(".csv") and any(hint in lower for hint in MONITORING_METRIC_NAME_HINTS):
+        return True
+    if name.startswith("events.out.tfevents") or ".tfevents." in name:
+        return True
+    return False
+
+
+MONITORING_REGEX_SUGGESTIONS = (
+    (r"epoch\s*[=: ]?\s*(\d+)", r"(?:train_?|tr_?)?loss\s*[=: ]?\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", ["epoch", "loss"]),
+    (r"epoch\s+(\d+)\s*/\s*(\d+)", r"loss[=: ]+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", ["epoch", "loss"]),
+    (r"step\s*[=: ]?\s*(\d+)", r"loss\s*[=: ]?\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", ["step", "loss"]),
+    (r"iter(?:ation)?\s*[=: ]?\s*(\d+)", r"loss\s*[=: ]?\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", ["iter", "loss"]),
+)
+
+
+def suggest_regex_metrics(log_path: Path) -> tuple[str, str, list[str], int]:
+    lines = tail_lines_fast(log_path, 300)
+    text = "\n".join(lines)
+    for left, right, fields in MONITORING_REGEX_SUGGESTIONS:
+        pattern = f"{left}.*?{right}"
+        try:
+            matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        except re.error:
+            continue
+        if len(matches) >= 2:
+            return pattern, "regex", fields, len(matches)
+    return "", "none", [], 0
+
+
+def parse_log_regex(path: Path, pattern: str, fields: list[str], max_points: int = 120) -> list[dict[str, Any]]:
+    if not pattern or not fields or not path.exists():
+        return []
+    try:
+        compiled = re.compile(pattern)
+    except re.error:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in tail_lines_fast(path, 4000):
+        match = compiled.search(line)
+        if not match:
+            continue
+        row: dict[str, Any] = {}
+        for index, field in enumerate(fields or []):
+            group = match.group(index + 1)
+            if group is None:
+                continue
+            try:
+                row[str(field)] = float(group)
+            except ValueError:
+                row[str(field)] = str(group)
+        if not row:
+            continue
+        if "epoch" in row:
+            row["time"] = row["epoch"]
+        elif "step" in row:
+            row["time"] = row["step"]
+        elif "iter" in row:
+            row["time"] = row["iter"]
+        else:
+            row["time"] = len(rows)
+        rows.append(row)
+        if len(rows) >= max_points * 5:
+            break
+    return rows[-max_points:]
+
+
+def metric_preview_rows(kind: str, path: Path, pattern: str, fields: list[str], limit: int = 3) -> tuple[list[dict[str, Any]], int]:
+    rows: list[dict[str, Any]] = []
+    if kind == "jsonl":
+        all_rows = read_numeric_jsonl(path, 500)
+        return all_rows[:limit], len(all_rows)
+    if kind == "csv":
+        all_rows = read_numeric_csv(path, 500)
+        return all_rows[:limit], len(all_rows)
+    if kind == "regex":
+        all_rows = parse_log_regex(path, pattern, fields, 120)
+        return all_rows[:limit], len(all_rows)
+    return rows, 0
+
+
+def directory_tree_summary(root: Path) -> str:
+    lines: list[str] = []
+    file_count = 0
+    dir_count = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        relative = Path(dirpath).relative_to(root)
+        if len(relative.parts) > 4:
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(name for name in dirnames if name not in MONITORING_NOISE_DIRS and not name.startswith("."))
+        dir_count += 1
+        for name in sorted(filenames)[:40]:
+            try:
+                size = (Path(dirpath) / name).stat().st_size
+            except OSError:
+                size = 0
+            lines.append(f"{(str(relative / name)).replace(os.sep, '/')} ({size} bytes)")
+            file_count += 1
+            if len(lines) >= 150:
+                break
+        if len(lines) >= 150:
+            break
+    return f"directory tree ({file_count} files shown, {dir_count} dirs):\n" + "\n".join(lines)
+
+
+def llm_chat(llm: dict[str, Any], system: str, user: str) -> tuple[str | None, str | None]:
+    provider = str(llm.get("provider") or "openai-compatible")
+    preset = LLM_PRESETS.get(provider, LLM_PRESETS["openai-compatible"])
+    base_url = str(llm.get("base_url") or preset.get("base_url") or "").strip()
+    model = str(llm.get("model") or preset.get("model") or "").strip()
+    api_key = resolve_llm_api_key(llm)
+    timeout = int_setting(llm.get("timeout_seconds"), 60, 5, 600)
+    if not base_url:
+        return None, "LLM base URL is not configured"
+    if preset.get("key_required") and not api_key:
+        return None, "LLM API key is not configured"
+    if provider == "anthropic":
+        if not model:
+            return None, "Anthropic model is not configured"
+        url = base_url.rstrip("/") + "/v1/messages"
+        payload = json.dumps({
+            "model": model,
+            "max_tokens": 1024,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+    else:
+        if not model:
+            return None, f"{provider} model is not configured"
+        endpoint = base_url.rstrip("/")
+        if not endpoint.endswith("/v1"):
+            endpoint += "/v1"
+        url = endpoint + "/chat/completions"
+        payload = json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0,
+            "max_tokens": 1024,
+        }).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        with urlopen(Request(url, data=payload, headers=headers), timeout=timeout) as response:
+            raw = response.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+    except (OSError, HTTPError, URLError) as exc:
+        detail = exc.reason if isinstance(exc, HTTPError) else str(exc)
+        return None, f"LLM request failed: {detail}"
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "LLM returned non-JSON response"
+    if provider == "anthropic":
+        content = (parsed.get("content") or []) if isinstance(parsed, dict) else []
+        text = "".join(str(block.get("text") or "") for block in content if isinstance(block, dict))
+    else:
+        choices = parsed.get("choices") if isinstance(parsed, dict) else None
+        message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        text = str(message.get("content") or "")
+    if not text:
+        return None, "LLM returned an empty response"
+    return text, None
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(text[start:index + 1])
+                except json.JSONDecodeError:
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+MONITORING_LLM_SYSTEM = (
+    "You are a task-output recognition assistant for an experiment monitor. "
+    "Given a directory tree of a project, identify the task runs and their output formats. "
+    "Respond with ONLY a JSON object of the shape: "
+    '{"runs": [{"name": "short run name", "dir": "relative dir of run outputs (empty string for project root)", '
+    '"logs": ["relative paths to log files"], '
+    '"metrics": {"kind": "regex|jsonl|csv|tensorboard|wandb|mlflow|none", "path": "relative file or dir path", '
+    '"pattern": "regex with capture groups when kind is regex", "fields": ["field names in capture-group order"]}}]}. '
+    "Only include runs whose outputs actually exist in the tree. Keep log paths exact."
+)
+
+
+def llm_recognize_directory(root: Path) -> tuple[list[dict[str, Any]], str]:
+    llm = llm_config()
+    if not llm_effective_enabled(llm):
+        return [], "LLM not enabled"
+    tree = directory_tree_summary(root)
+    previews: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        relative = Path(dirpath).relative_to(root)
+        if len(relative.parts) > 4:
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(name for name in dirnames if name not in MONITORING_NOISE_DIRS)
+        for name in sorted(filenames):
+            if not looks_like_log_file(name):
+                continue
+            path = Path(dirpath) / name
+            try:
+                with path.open("rb") as handle:
+                    head_text = handle.read(8192).decode("utf-8", errors="replace")
+            except OSError:
+                head_text = ""
+            head = "\n".join(head_text.splitlines()[:3])
+            tail = "\n".join(tail_lines_fast(path, 6))
+            previews.append(f"--- {(str(relative / name)).replace(os.sep, '/')} ---\n{head}\n...\n{tail}")
+            if len(previews) >= 3:
+                break
+        if len(previews) >= 3:
+            break
+    user = (
+        f"Project directory: {root}\n\n{tree}\n\n"
+        f"Sample contents of likely log files:\n" + ("\n".join(previews) if previews else "(none found)") +
+        "\n\nIdentify the task runs and their output formats."
+    )
+    text, error = llm_chat(llm, MONITORING_LLM_SYSTEM, user)
+    if error:
+        return [], error
+    parsed = extract_json_object(text or "")
+    if not parsed:
+        return [], "LLM response could not be parsed as JSON"
+    raw_runs = parsed.get("runs")
+    if not isinstance(raw_runs, list):
+        return [], "LLM response missing runs list"
+    runs: list[dict[str, Any]] = []
+    for item in raw_runs:
+        if not isinstance(item, dict):
+            continue
+        rel_dir = str(item.get("dir") or "").strip().strip("/")
+        scope = safe_relative_path(root, rel_dir) or (root if not rel_dir else None)
+        if scope is None or not scope.is_dir():
+            continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+        logs: list[str] = []
+        for raw_log in item.get("logs") or []:
+            log_path = safe_relative_path(root, str(raw_log))
+            if log_path and log_path.is_file():
+                logs.append(str(log_path.relative_to(root)))
+        if not logs and not metrics.get("kind"):
+            continue
+        kind = str(metrics.get("kind") or "none").strip() or "none"
+        metric_path = str(metrics.get("path") or "").strip()
+        if kind in {"regex", "jsonl", "csv"}:
+            resolved = safe_relative_path(root, metric_path)
+            if resolved is None or not resolved.is_file():
+                kind = "none"
+                metric_path = ""
+        runs.append({
+            "name": str(item.get("name") or (Path(rel_dir).name if rel_dir else root.name)).strip() or root.name,
+            "scope": rel_dir,
+            "logs": logs,
+            "metrics": {
+                "kind": kind,
+                "path": metric_path,
+                "pattern": str(metrics.get("pattern") or "").strip(),
+                "fields": string_list(metrics.get("fields")),
+            },
+        })
+    return runs, ""
+
+
+def scan_directory_for_runs(root: Path) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return candidates
+    scopes: list[dict[str, Any]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        relative = Path(dirpath).relative_to(root)
+        if len(relative.parts) > MONITORING_SCAN_MAX_DEPTH:
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(name for name in dirnames if name not in MONITORING_NOISE_DIRS and not name.startswith("."))
+        logs = sorted(name for name in filenames if looks_like_log_file(name))
+        metric_files = sorted(name for name in filenames if looks_like_metric_file(name))
+        wandb_dirs = sorted(name for name in dirnames if name.startswith("run-") or name.startswith("offline-run-"))
+        wandb_dirs = wandb_dirs or (["wandb"] if "wandb" in dirnames else [])
+        has_mlflow = "mlruns" in dirnames
+        touched = logs + metric_files
+        latest_mtime = 0.0
+        for name in touched:
+            try:
+                latest_mtime = max(latest_mtime, (Path(dirpath) / name).stat().st_mtime)
+            except OSError:
+                pass
+        if touched or wandb_dirs or has_mlflow:
+            scopes.append({
+                "relative": relative,
+                "logs": logs,
+                "metric_files": metric_files,
+                "wandb_dirs": wandb_dirs,
+                "mlflow": has_mlflow,
+                "mtime": latest_mtime,
+            })
+    scopes.sort(key=lambda item: item["mtime"], reverse=True)
+    # Drop container scopes (no direct logs) whose children carry the logs.
+    kept: list[dict[str, Any]] = []
+    for scope in scopes:
+        if not scope["logs"]:
+            ancestor_of_child = any(
+                other is not scope
+                and other["logs"]
+                and str(other["relative"]).startswith(str(scope["relative"]) + os.sep)
+                for other in scopes
+            )
+            if ancestor_of_child:
+                continue
+        kept.append(scope)
+    for scope in kept[:MONITORING_SCAN_MAX_CANDIDATES]:
+        scope_dir = root / scope["relative"]
+        relative_text = str(scope["relative"]).replace(os.sep, "/")
+        name = scope["relative"].name if str(scope["relative"]) not in {"", "."} else root.name
+        log_paths = [scope_dir / log_name for log_name in scope["logs"]]
+        primary_log = log_paths[0] if log_paths else None
+        pattern, kind, fields, match_count = suggest_regex_metrics(primary_log) if primary_log else ("", "none", [], 0)
+        metrics: dict[str, Any]
+        if scope["wandb_dirs"]:
+            metrics = {"kind": "wandb", "path": f"{relative_text}/{scope['wandb_dirs'][0]}" if relative_text else scope["wandb_dirs"][0]}
+            confidence = "high"
+        elif scope["mlflow"]:
+            metrics = {"kind": "mlflow", "path": "mlruns"}
+            confidence = "high"
+        else:
+            tfevents = [item for item in scope["metric_files"] if item.startswith("events.out.tfevents") or ".tfevents." in item]
+            jsonls = [item for item in scope["metric_files"] if item.endswith(".jsonl")]
+            csvs = [item for item in scope["metric_files"] if item.endswith(".csv")]
+            if tfevents:
+                metrics = {"kind": "tensorboard", "path": relative_text or "."}
+                confidence = "high"
+            elif jsonls:
+                metrics = {"kind": "jsonl", "path": f"{relative_text}/{jsonls[0]}" if relative_text else jsonls[0]}
+                confidence = "high"
+            elif csvs:
+                metrics = {"kind": "csv", "path": f"{relative_text}/{csvs[0]}" if relative_text else csvs[0]}
+                confidence = "high"
+            elif kind == "regex":
+                metrics = {"kind": "regex", "path": f"{relative_text}/{scope['logs'][0]}" if relative_text else scope["logs"][0], "pattern": pattern, "fields": fields}
+                confidence = "medium"
+            elif scope["logs"]:
+                metrics = {"kind": "none", "path": ""}
+                confidence = "low"
+            else:
+                metrics = {"kind": "none", "path": ""}
+                confidence = "low"
+        preview_path: Path | None = None
+        if metrics["kind"] == "regex" and metrics.get("path"):
+            preview_path = safe_relative_path(root, str(metrics["path"]))
+        elif metrics["kind"] == "jsonl" and metrics.get("path"):
+            preview_path = safe_relative_path(root, str(metrics["path"]))
+        elif metrics["kind"] == "csv" and metrics.get("path"):
+            preview_path = safe_relative_path(root, str(metrics["path"]))
+        preview_rows, preview_count = metric_preview_rows(metrics["kind"], preview_path, metrics.get("pattern") or "", metrics.get("fields") or []) if preview_path else ([], 0)
+        if metrics["kind"] == "regex" and match_count:
+            preview_count = match_count
+        log_tail = tail_lines_fast(primary_log, 30) if primary_log else []
+        candidates.append({
+            "name": name,
+            "scope": relative_text,
+            "logs": [str((scope_dir / item).relative_to(root)).replace(os.sep, "/") for item in scope["logs"]],
+            "logPreview": log_tail,
+            "metrics": metrics,
+            "metricPreview": {"rows": preview_rows, "rowCount": preview_count},
+            "confidence": confidence,
+            "status": "running" if scope["mtime"] and time.time() - scope["mtime"] < MONITORING_RUNNING_WINDOW_SECONDS else "finished",
+            "mtime": datetime.fromtimestamp(scope["mtime"]).isoformat(timespec="seconds") if scope["mtime"] else "",
+            "source": "heuristic",
+        })
+    return candidates
+
+
+def monitoring_scan_payload(path_text: str, use_llm: bool) -> tuple[int, dict[str, Any]]:
+    root = Path(os.path.expandvars(os.path.expanduser(path_text)))
+    if not root.is_dir():
+        return 200, {"ok": True, "path": str(root), "exists": False, "candidates": [], "llm": {"used": False, "enabled": llm_effective_enabled(llm_config()), "error": "directory does not exist"}}
+    candidates = scan_directory_for_runs(root)
+    llm_used = False
+    llm_error = ""
+    llm_enabled = llm_effective_enabled(llm_config())
+    if use_llm and llm_enabled and (not candidates or all(item.get("confidence") == "low" for item in candidates)):
+        llm_candidates, llm_error = llm_recognize_directory(root)
+        if llm_candidates:
+            existing_scopes = {str(item.get("scope")) for item in candidates}
+            merged = [item for item in candidates if item.get("confidence") != "low"]
+            for item in llm_candidates:
+                if str(item.get("scope")) in existing_scopes:
+                    continue
+                scope_dir = safe_relative_path(root, str(item.get("scope") or "")) or root
+                log_paths = [safe_relative_path(root, rel) for rel in item.get("logs") or []]
+                log_paths = [path for path in log_paths if path]
+                metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+                preview_rows, preview_count = metric_preview_rows(
+                    str(metrics.get("kind") or "none"),
+                    safe_relative_path(root, str(metrics.get("path") or "")) if metrics.get("path") else None,
+                    str(metrics.get("pattern") or ""),
+                    string_list(metrics.get("fields")),
+                )
+                merged.append({
+                    **item,
+                    "logPreview": tail_lines_fast(log_paths[0], 30) if log_paths else [],
+                    "metricPreview": {"rows": preview_rows, "rowCount": preview_count},
+                    "confidence": "medium",
+                    "status": "finished",
+                    "mtime": "",
+                    "source": "llm",
+                })
+            candidates = merged
+            llm_used = True
+    file_count = 0
+    dir_count = 0
+    total_bytes = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        relative = Path(dirpath).relative_to(root)
+        if len(relative.parts) > 4:
+            dirnames[:] = []
+        dirnames[:] = [name for name in dirnames if name not in MONITORING_NOISE_DIRS]
+        dir_count += 1
+        for name in filenames:
+            try:
+                total_bytes += (Path(dirpath) / name).stat().st_size
+            except OSError:
+                pass
+            file_count += 1
+    return 200, {
+        "ok": True,
+        "path": str(root),
+        "exists": True,
+        "tree": {"files": file_count, "dirs": dir_count, "bytes": total_bytes},
+        "candidates": candidates,
+        "llm": {"used": llm_used, "enabled": llm_enabled, "error": llm_error},
+    }
+
+
+def auto_directory_status(log_text: str, latest_mtime: float) -> str:
+    if latest_mtime and time.time() - latest_mtime < MONITORING_RUNNING_WINDOW_SECONDS:
+        return "running"
+    lowered = log_text.lower()
+    if any(marker in lowered for marker in MONITORING_ERROR_MARKERS):
+        return "failed"
+    return "finished"
+
+
+def build_directory_run(dir_entry: dict[str, Any], run_item: dict[str, Any]) -> dict[str, Any] | None:
+    root = config_path(str(dir_entry.get("path") or ""))
+    if not root.is_dir():
+        return None
+    scope_rel = str(run_item.get("scope") or "")
+    scope = safe_relative_path(root, scope_rel) if scope_rel else root
+    if scope is None or not scope.is_dir():
+        return None
+    name = str(run_item.get("name") or "").strip() or (scope.name if scope != root else root.name)
+
+    log_paths: list[Path] = []
+    for rel in run_item.get("logs") or []:
+        path = safe_relative_path(root, str(rel)) or safe_relative_path(scope, str(rel))
+        if path and path.is_file():
+            log_paths.append(path)
+    log_text = "\n".join(line for path in log_paths for line in tail_lines_fast(path, 60))
+
+    metrics: list[dict[str, Any]] = []
+    metrics_doc = run_item.get("metrics") if isinstance(run_item.get("metrics"), dict) else {}
+    metric_kind = str(metrics_doc.get("kind") or "none")
+    metric_path_text = str(metrics_doc.get("path") or "")
+    if metric_kind == "jsonl" and metric_path_text:
+        path = safe_relative_path(root, metric_path_text) or safe_relative_path(scope, metric_path_text)
+        if path and path.is_file():
+            metrics = read_numeric_jsonl(path, int(CONFIG.get("protocol", {}).get("max_metric_points", 120)))
+    elif metric_kind == "csv" and metric_path_text:
+        path = safe_relative_path(root, metric_path_text) or safe_relative_path(scope, metric_path_text)
+        if path and path.is_file():
+            metrics = read_numeric_csv(path, int(CONFIG.get("protocol", {}).get("max_metric_points", 120)))
+    elif metric_kind == "regex":
+        pattern = str(metrics_doc.get("pattern") or "")
+        fields = string_list(metrics_doc.get("fields"))
+        path = safe_relative_path(root, metric_path_text) or (log_paths[0] if log_paths else safe_relative_path(scope, metric_path_text))
+        if path and path.is_file():
+            metrics = parse_log_regex(path, pattern, fields, int(CONFIG.get("protocol", {}).get("max_metric_points", 120)))
+
+    touched = [*log_paths]
+    for rel in run_item.get("logs") or []:
+        path = safe_relative_path(root, str(rel)) or safe_relative_path(scope, str(rel))
+        if path and path.is_file():
+            touched.append(path)
+    latest_mtime = max([path.stat().st_mtime for path in touched if path.exists()] + [scope.stat().st_mtime if scope.exists() else 0]) if touched else (scope.stat().st_mtime if scope.exists() else 0)
+    ended_at = datetime.fromtimestamp(latest_mtime).isoformat(timespec="seconds") if latest_mtime else ""
+    status = str(run_item.get("status") or "").strip()
+    if status not in {"running", "finished", "failed", "killed"}:
+        status = auto_directory_status(log_text, latest_mtime)
+    run_id = "dirrun:" + hashlib.sha1(f"{root}|{scope_rel}|{name}".encode("utf-8")).hexdigest()[:12]
+    latest_metric, best_metric = summarize_metric(metrics)
+    summary = build_run_summary(status, {"status": status}, 0, [], metrics, [], "-")
+    return {
+        "id": run_id,
+        "project": str(dir_entry.get("project") or "").strip() or root.name,
+        "name": name,
+        "status": status,
+        "resourceType": str(dir_entry.get("resource_type") or "").strip() or "unknown",
+        "hostId": canonical_host_id(),
+        "user": "directory",
+        "rootPid": 0,
+        "rootCreateTime": format_create_time(latest_mtime, ended_at),
+        "command": shorten_command(f"directory monitoring: {root}"),
+        "cwd": str(scope),
+        "runtime": "",
+        "endedAt": ended_at,
+        "exitCode": None,
+        "exitCodeKnown": False,
+        "rootCpuPercent": 0,
+        "processTreeCpuPercent": 0,
+        "cpuPercent": 0,
+        "memoryGb": 0,
+        "gpuLabel": "-",
+        "gpuMemoryGb": 0,
+        "gpuUtilPercent": 0,
+        "gpuPowerW": 0,
+        "gpuTemperatureC": 0,
+        "diskIo": 0,
+        "latestMetric": latest_metric,
+        "bestMetric": best_metric,
+        "entrypointKind": "file",
+        "tags": ["directory"],
+        "accessLevel": "C",
+        "processTree": empty_process_node(0, name),
+        "hparams": {},
+        "logs": [line for path in log_paths for line in tail_lines_fast(path, 40)][:80] or ["no log file declared"],
+        "metrics": metrics,
+        "resources": [],
+        "events": [],
+        "summary": summary,
+        "metadata": run_metadata_for(run_id),
+        "visualizations": discover_visualizations(scope),
+        "source": "directory",
+        "monitoredDir": str(root),
+        "scopeDir": str(scope),
+    }
+
+
+def build_directory_runs_for(dir_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    recognition = dir_entry.get("recognition") if isinstance(dir_entry.get("recognition"), dict) else {}
+    runs = []
+    for run_item in recognition.get("runs") or []:
+        if not isinstance(run_item, dict):
+            continue
+        run = build_directory_run(dir_entry, run_item)
+        if run:
+            runs.append(run)
+    return runs
+
+
+def discover_directory_runs() -> list[dict[str, Any]]:
+    now = time.time()
+    results: list[dict[str, Any]] = []
+    for dir_entry in monitoring_config().get("dirs") or []:
+        if not isinstance(dir_entry, dict) or not dir_entry.get("enabled", True):
+            continue
+        path_text = str(dir_entry.get("path") or "")
+        if not path_text:
+            continue
+        cached = DIRECTORY_RUNS_CACHE.get(path_text)
+        if cached and cached[0] > now:
+            results.extend(cached[1])
+            continue
+        runs = build_directory_runs_for(dir_entry)
+        DIRECTORY_RUNS_CACHE[path_text] = (now + MONITORING_RUN_TTL_SECONDS, runs)
+        results.extend(runs)
+    return results
+
+
+def save_monitored_dir(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    global CONFIG
+    entry = normalize_monitored_dir(payload)
+    if not entry:
+        return 400, {"ok": False, "error": "monitored directory requires a path"}
+    monitoring = monitoring_config()
+    dirs = [item for item in monitoring.get("dirs") or [] if isinstance(item, dict) and str(item.get("path")) != entry["path"]]
+    dirs.append(entry)
+    next_config = deep_merge(CONFIG, {"project_monitoring": {**monitoring, "dirs": dirs}})
+    try:
+        write_yaml_config(config_path(CONFIG_FILE), next_config)
+    except Exception as exc:
+        return 500, {"ok": False, "error": str(exc)}
+    CONFIG = next_config
+    DIRECTORY_RUNS_CACHE.clear()
+    with SNAPSHOT_LOCK:
+        LATEST_SNAPSHOT = None
+    return 200, {"ok": True, "directory": entry, "config": CONFIG, "metadata": config_metadata()}
+
+
+def delete_monitored_dir(index: int) -> tuple[int, dict[str, Any]]:
+    global CONFIG
+    monitoring = monitoring_config()
+    dirs = [item for item in monitoring.get("dirs") or [] if isinstance(item, dict)]
+    if index < 0 or index >= len(dirs):
+        return 404, {"ok": False, "error": "monitored directory not found"}
+    dirs.pop(index)
+    next_config = deep_merge(CONFIG, {"project_monitoring": {**monitoring, "dirs": dirs}})
+    try:
+        write_yaml_config(config_path(CONFIG_FILE), next_config)
+    except Exception as exc:
+        return 500, {"ok": False, "error": str(exc)}
+    CONFIG = next_config
+    DIRECTORY_RUNS_CACHE.clear()
+    with SNAPSHOT_LOCK:
+        LATEST_SNAPSHOT = None
+    return 200, {"ok": True, "config": CONFIG, "metadata": config_metadata()}
+
+
+def test_llm_config(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    candidate = normalize_llm_config(payload if isinstance(payload, dict) else {})
+    candidate["enabled"] = True
+    text, error = llm_chat(candidate, "You are a connectivity test.", "Reply with exactly: OK")
+    if error:
+        return 200, {"ok": False, "error": error, "effective": False}
+    return 200, {"ok": True, "effective": True, "reply": (text or "").strip()[:200]}
+
+
 def discover_protocol_runs(gpus: list[dict[str, Any]]) -> list[dict[str, Any]]:
     runs = []
     for run_dir in find_manifest_dirs():
@@ -4491,7 +5326,14 @@ def collect_snapshot() -> dict[str, Any]:
         except (psutil.AccessDenied, psutil.NoSuchProcess):
             pass
 
-    local_runs = protocol_runs + unmanaged_runs
+    local_runs = protocol_runs + unmanaged_runs + discover_directory_runs()
+    protocol_run_dirs = {os.path.normcase(str(path.resolve())) for path in find_manifest_dirs()}
+    local_runs = [
+        run
+        for run in local_runs
+        if run.get("source") != "directory"
+        or os.path.normcase(str(Path(str(run.get("scopeDir") or "")).resolve())) not in protocol_run_dirs
+    ]
     attribute_gpu_processes_to_runs(local_runs, gpus)
     remote_hosts, remote_runs = cached_remote_monitoring()
     runs = local_runs + remote_runs
@@ -4654,6 +5496,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ssh/servers":
             self.send_json(ssh_servers_payload())
             return
+        if path == "/api/monitoring/llm/status":
+            llm = llm_config()
+            self.send_json({
+                "ok": True,
+                "enabled": llm_effective_enabled(llm),
+                "configured": bool(llm.get("enabled")),
+                "provider": str(llm.get("provider") or "openai-compatible"),
+                "model": str(llm.get("model") or ""),
+                "baseUrl": str(llm.get("base_url") or ""),
+                "hasKey": bool(resolve_llm_api_key(llm)),
+            })
+            return
         if path == "/api/config":
             self.send_json({"ok": True, "config": CONFIG, "metadata": config_metadata()})
             return
@@ -4692,6 +5546,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/config":
             status, payload = save_collector_config(read_json_body(self))
+            self.send_json(payload, status=status)
+            return
+        if path == "/api/monitoring/scan":
+            body = read_json_body(self)
+            path_text = str(body.get("path") or "").strip()
+            if not path_text:
+                self.send_json({"ok": False, "error": "path is required"}, status=400)
+                return
+            use_llm = bool(body.get("useLlm", True))
+            status, payload = monitoring_scan_payload(path_text, use_llm)
+            self.send_json(payload, status=status)
+            return
+        if path == "/api/monitoring/dirs":
+            status, payload = save_monitored_dir(read_json_body(self))
+            self.send_json(payload, status=status)
+            return
+        if path == "/api/monitoring/llm/test":
+            status, payload = test_llm_config(read_json_body(self))
             self.send_json(payload, status=status)
             return
         match = re.fullmatch(r"/api/runs/([^/]+)/kill", path)
@@ -4751,6 +5623,11 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/ssh/servers":
             status, payload = clear_ssh_servers()
+            self.send_json(payload, status=status)
+            return
+        match = re.fullmatch(r"/api/monitoring/dirs/(\d+)", path)
+        if match:
+            status, payload = delete_monitored_dir(int(match.group(1)))
             self.send_json(payload, status=status)
             return
         match = re.fullmatch(r"/api/ssh/servers/([^/]+)", path)

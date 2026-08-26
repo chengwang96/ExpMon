@@ -6,9 +6,15 @@ import {
   Battery,
   BatteryCharging,
   BatteryFull,
+  Check,
   Cpu,
   Database,
+  Eye,
+  EyeOff,
   FileText,
+  FolderOpen,
+  FolderPlus,
+  FolderSearch,
   Gauge,
   HardDrive,
   HeartPulse,
@@ -19,11 +25,13 @@ import {
   Network,
   Play,
   RefreshCw,
+  RotateCcw,
   Search,
   Server,
   Plus,
   Settings,
   SlidersHorizontal,
+  Sparkles,
   TerminalSquare,
   Trash2,
   Workflow,
@@ -364,6 +372,9 @@ type Run = {
   metadata?: RunMetadata;
   visualizations?: RunVisualization[];
   gpuProcesses?: GpuProcess[];
+  source?: string;
+  monitoredDir?: string;
+  scopeDir?: string;
 };
 
 type Project = {
@@ -444,6 +455,74 @@ type CollectorConfig = {
     max_scan_depth?: number;
     max_metric_points?: number;
   };
+  project_monitoring?: {
+    dirs?: MonitoredDir[];
+    llm?: MonitoringLlm;
+  };
+};
+
+type MonitoredMetrics = {
+  kind: "none" | "regex" | "jsonl" | "csv" | "tensorboard" | "wandb" | "mlflow";
+  path?: string;
+  pattern?: string;
+  fields?: string[];
+};
+
+type MonitoredRunRec = {
+  name: string;
+  scope: string;
+  logs: string[];
+  metrics: MonitoredMetrics;
+  status?: string;
+};
+
+type MonitoredDir = {
+  path: string;
+  enabled: boolean;
+  project?: string;
+  resource_type?: string;
+  recognition?: { runs?: MonitoredRunRec[] };
+};
+
+type MonitoringLlm = {
+  enabled?: boolean;
+  provider?: string;
+  base_url?: string;
+  model?: string;
+  api_key?: string;
+  timeout_seconds?: number;
+};
+
+type MonitoringCandidate = {
+  name: string;
+  scope: string;
+  logs: string[];
+  logPreview?: string[];
+  metrics: MonitoredMetrics;
+  metricPreview?: { rows: Array<Record<string, number | string>>; rowCount: number };
+  confidence: string;
+  status: string;
+  mtime?: string;
+  source: string;
+};
+
+type MonitoringScanReport = {
+  ok: boolean;
+  path: string;
+  exists?: boolean;
+  tree?: { files: number; dirs: number; bytes: number };
+  candidates: MonitoringCandidate[];
+  llm?: { used: boolean; enabled: boolean; error?: string };
+};
+
+type MonitoringLlmStatus = {
+  ok: boolean;
+  enabled: boolean;
+  configured: boolean;
+  provider: string;
+  model: string;
+  baseUrl: string;
+  hasKey: boolean;
 };
 
 type ConfigMetadata = {
@@ -938,7 +1017,65 @@ const TEXT = {
     powerSearchSensor: "搜索传感器或硬件分组",
     powerDriver: "AIDA64 驱动",
     powerRunning: "运行中",
-    powerStopped: "未运行"
+    powerStopped: "未运行",
+    monitoredDirs: "输出目录监控",
+    monitoredDirsBody: "添加整个项目目录，ExpMon 会自动识别其中的任务日志与指标输出（含已结束的任务）。识别困难时可借助 LLM，在配置页填写 API Key 后启用。",
+    addMonitoredDir: "添加监控目录",
+    monitoredDirPath: "项目目录路径",
+    browseDir: "浏览…",
+    scanDirectory: "扫描识别",
+    scanningDirectory: "扫描中…",
+    scanSummary: "扫描结果",
+    scanFiles: "文件",
+    scanDirs: "目录",
+    scanBytes: "大小",
+    scanCandidates: "识别到候选任务",
+    selectAll: "全选",
+    deselectAll: "取消全选",
+    noCandidates: "未识别到任务输出",
+    noCandidatesBody: "目录里没有找到日志或指标文件。可以尝试勾选 LLM 辅助识别，或手动确认目录结构。",
+    includeRun: "纳入监控",
+    runName: "任务名称",
+    runScope: "所在目录",
+    logFiles: "日志文件",
+    metricFormat: "指标格式",
+    metricNone: "无指标（仅日志）",
+    metricPath: "指标文件",
+    regexPattern: "提取正则",
+    regexFields: "字段（按捕获组顺序，逗号分隔）",
+    logPreview: "日志预览",
+    metricPreview: "指标预览",
+    metricRows: "条数据",
+    confidence: "置信度",
+    confidenceHigh: "高",
+    confidenceMedium: "中",
+    confidenceLow: "低",
+    sourceHeuristic: "自动识别",
+    sourceLlm: "LLM 识别",
+    saveMonitoredDir: "确认并保存",
+    removeMonitoredDir: "移除监控目录",
+    confirmRemoveDirTitle: "移除监控目录",
+    confirmRemoveDirBody: "将从监控列表移除该目录，已识别的任务不再显示：",
+    llmAssist: "LLM 辅助识别",
+    llmAssistHint: "自动识别结果不确定时，调用 LLM 分析目录结构。需在配置页启用并填写 API Key（Ollama/opencode 本地服务无需 Key）。",
+    llmUnavailable: "LLM 未启用（配置页填写 API Key 后可用）",
+    llmUsed: "本次扫描使用了 LLM 辅助识别",
+    llmError: "LLM 调用失败",
+    monitoringScanError: "扫描失败",
+    directorySource: "目录监控",
+    directorySourceHint: "该任务来自输出目录监控，按已确认的格式解析日志与指标。",
+    llmSection: "目录识别 LLM（可选）",
+    llmSectionBody: "扫描项目目录识别输出格式遇到困难时调用 LLM。填写 API Key 后启用；Ollama / opencode 本地服务无需 Key。未启用时自动识别仍然可用。",
+    llmEnabled: "启用 LLM",
+    llmProvider: "Provider",
+    llmBaseUrl: "Base URL（留空使用默认）",
+    llmModel: "模型（留空使用默认）",
+    llmApiKey: "API Key（支持 env:变量名；留空回退环境变量）",
+    llmTimeout: "超时（秒）",
+    llmTest: "测试 LLM 连接",
+    llmTesting: "测试中…",
+    llmTestOk: "LLM 连接正常",
+    llmTestFailed: "LLM 测试失败"
   },
   en: {
     appSubtitle: "General experiment task monitor",
@@ -1230,7 +1367,65 @@ const TEXT = {
     powerSearchSensor: "Search sensors or hardware groups",
     powerDriver: "AIDA64 driver",
     powerRunning: "running",
-    powerStopped: "stopped"
+    powerStopped: "stopped",
+    monitoredDirs: "Output directory monitoring",
+    monitoredDirsBody: "Add a whole project directory; ExpMon recognizes task logs and metric outputs inside it (including finished tasks). When recognition is hard, an optional LLM can help after you configure an API key in Config.",
+    addMonitoredDir: "Add monitored directory",
+    monitoredDirPath: "Project directory path",
+    browseDir: "Browse…",
+    scanDirectory: "Scan & recognize",
+    scanningDirectory: "Scanning…",
+    scanSummary: "Scan result",
+    scanFiles: "files",
+    scanDirs: "dirs",
+    scanBytes: "size",
+    scanCandidates: "candidate tasks detected",
+    selectAll: "Select all",
+    deselectAll: "Select none",
+    noCandidates: "No task outputs recognized",
+    noCandidatesBody: "No log or metric files were found in this directory. Try enabling LLM-assisted recognition, or adjust the directory manually.",
+    includeRun: "Include",
+    runName: "Run name",
+    runScope: "Scope directory",
+    logFiles: "Log files",
+    metricFormat: "Metric format",
+    metricNone: "None (logs only)",
+    metricPath: "Metric file",
+    regexPattern: "Extraction regex",
+    regexFields: "Fields (capture-group order, comma separated)",
+    logPreview: "Log preview",
+    metricPreview: "Metric preview",
+    metricRows: "rows",
+    confidence: "Confidence",
+    confidenceHigh: "high",
+    confidenceMedium: "medium",
+    confidenceLow: "low",
+    sourceHeuristic: "heuristic",
+    sourceLlm: "LLM",
+    saveMonitoredDir: "Confirm & save",
+    removeMonitoredDir: "Remove monitored directory",
+    confirmRemoveDirTitle: "Remove monitored directory",
+    confirmRemoveDirBody: "This directory will be removed from monitoring and its recognized tasks will no longer appear:",
+    llmAssist: "LLM-assisted recognition",
+    llmAssistHint: "When the automatic recognition result is uncertain, ask the LLM to analyze the directory structure. Enable it in Config with an API key (local Ollama / opencode need no key).",
+    llmUnavailable: "LLM not enabled (fill an API key in Config to use it)",
+    llmUsed: "This scan used LLM-assisted recognition",
+    llmError: "LLM call failed",
+    monitoringScanError: "Scan failed",
+    directorySource: "Directory monitoring",
+    directorySourceHint: "This run comes from output directory monitoring and is parsed with the confirmed format.",
+    llmSection: "Directory recognition LLM (optional)",
+    llmSectionBody: "Called when scanning project directories struggles to recognize output formats. Enabled after an API key is provided; local Ollama / opencode need no key. Automatic recognition still works when disabled.",
+    llmEnabled: "Enable LLM",
+    llmProvider: "Provider",
+    llmBaseUrl: "Base URL (blank = default)",
+    llmModel: "Model (blank = default)",
+    llmApiKey: "API key (env:NAME supported; blank falls back to environment)",
+    llmTimeout: "Timeout (seconds)",
+    llmTest: "Test LLM connection",
+    llmTesting: "Testing…",
+    llmTestOk: "LLM connected",
+    llmTestFailed: "LLM test failed"
   }
 } as const;
 
@@ -2405,6 +2600,7 @@ function App() {
             projects={userFilteredProjects}
             runs={userFilteredRuns}
             hosts={hosts}
+            config={snapshot.config}
             userFilter={userFilter}
             userOptions={userOptions}
             onUserFilter={setUserFilter}
@@ -3363,6 +3559,17 @@ function Dashboard({
 const CONFIG_TEXT = {
   zh: {
     title: "本地采集器配置",
+    subtitle: "控制本机采集器的身份、采样节奏、任务发现与解析规则",
+    liveApply: "保存后立即生效 · 无需重启采集器",
+    unsaved: "有未保存的更改",
+    savedOk: "已保存",
+    discard: "放弃更改",
+    collectorSection: "采集器",
+    collectorSub: "主机标识与采样节奏",
+    discoverySection: "任务发现",
+    discoverySub: "实验目录、cwd 范围与受管任务扫描",
+    parserSection: "解析规则",
+    parserSub: "命令关键词与显式解析规则",
     storage: "配置文件",
     envConfig: "由 EXPMON_CONFIG 指定",
     defaultLocal: "本地配置文件",
@@ -3381,10 +3588,21 @@ const CONFIG_TEXT = {
     saving: "保存中",
     onePerLine: "每行一个值",
     jsonError: "显式解析规则必须是 JSON 数组",
-    savedHint: "保存后采集器会立即按新配置刷新；真实本地路径会写入被 gitignore 忽略的配置文件。"
+    savedHint: "真实本地路径会写入被 gitignore 忽略的配置文件。"
   },
   en: {
     title: "Local collector config",
+    subtitle: "Identity, sampling cadence, run discovery and parsing rules for the local collector",
+    liveApply: "Takes effect immediately after saving · no restart needed",
+    unsaved: "Unsaved changes",
+    savedOk: "Saved",
+    discard: "Discard changes",
+    collectorSection: "Collector",
+    collectorSub: "Host identity and sampling cadence",
+    discoverySection: "Run discovery",
+    discoverySub: "Experiment roots, cwd scope and managed run scanning",
+    parserSection: "Parser rules",
+    parserSub: "Command keywords and explicit parser rules",
     storage: "Config file",
     envConfig: "set by EXPMON_CONFIG",
     defaultLocal: "local config file",
@@ -3403,7 +3621,7 @@ const CONFIG_TEXT = {
     saving: "Saving",
     onePerLine: "One value per line",
     jsonError: "explicit rules must be a JSON array",
-    savedHint: "After saving, the collector refreshes with the new config. Real local paths are written to a gitignored local config file."
+    savedHint: "Real local paths are written to a gitignored local config file."
   }
 } as const;
 
@@ -3473,6 +3691,7 @@ function ConfigView({
   onSave: (config: CollectorConfig) => void;
 }) {
   const language = useContext(I18nContext);
+  const t = useT();
   const labels = CONFIG_TEXT[language];
   const [hostId, setHostId] = useState(config?.host_id ?? "local");
   const [interval, setIntervalValue] = useState(String(config?.sampling?.interval_seconds ?? 3));
@@ -3483,15 +3702,26 @@ function ConfigView({
   const [includeKeywords, setIncludeKeywords] = useState(arrayToLines(config?.run_discovery?.include_command_keywords));
   const [excludeKeywords, setExcludeKeywords] = useState(arrayToLines(config?.run_discovery?.exclude_command_keywords));
   const [rulesJson, setRulesJson] = useState(JSON.stringify(config?.run_discovery?.explicit_rules ?? [], null, 2));
+  const [llmEnabled, setLlmEnabled] = useState(Boolean(config?.project_monitoring?.llm?.enabled));
+  const [llmProvider, setLlmProvider] = useState(config?.project_monitoring?.llm?.provider ?? "openai-compatible");
+  const [llmBaseUrl, setLlmBaseUrl] = useState(config?.project_monitoring?.llm?.base_url ?? "");
+  const [llmModel, setLlmModel] = useState(config?.project_monitoring?.llm?.model ?? "");
+  const [llmApiKey, setLlmApiKey] = useState(config?.project_monitoring?.llm?.api_key ?? "");
+  const [llmTimeout, setLlmTimeout] = useState(String(config?.project_monitoring?.llm?.timeout_seconds ?? 60));
+  const [llmTestState, setLlmTestState] = useState<{ tone: "ok" | "err"; message: string } | null>(null);
   const [error, setError] = useState("");
   const [dirty, setDirty] = useState(false);
+  const [pendingSave, setPendingSave] = useState(false);
   const [syncedFingerprint, setSyncedFingerprint] = useState(configFingerprint(config));
 
   useEffect(() => {
-    if (dirty) {
+    const nextFingerprint = configFingerprint(config);
+    if (pendingSave && nextFingerprint !== syncedFingerprint) {
+      setDirty(false);
+      setPendingSave(false);
+    } else if (pendingSave || dirty) {
       return;
     }
-    const nextFingerprint = configFingerprint(config);
     setHostId(config?.host_id ?? "local");
     setIntervalValue(String(config?.sampling?.interval_seconds ?? 3));
     setUnmanagedTop(String(config?.sampling?.unmanaged_top_n ?? 80));
@@ -3501,8 +3731,14 @@ function ConfigView({
     setIncludeKeywords(arrayToLines(config?.run_discovery?.include_command_keywords));
     setExcludeKeywords(arrayToLines(config?.run_discovery?.exclude_command_keywords));
     setRulesJson(JSON.stringify(config?.run_discovery?.explicit_rules ?? [], null, 2));
+    setLlmEnabled(Boolean(config?.project_monitoring?.llm?.enabled));
+    setLlmProvider(config?.project_monitoring?.llm?.provider ?? "openai-compatible");
+    setLlmBaseUrl(config?.project_monitoring?.llm?.base_url ?? "");
+    setLlmModel(config?.project_monitoring?.llm?.model ?? "");
+    setLlmApiKey(config?.project_monitoring?.llm?.api_key ?? "");
+    setLlmTimeout(String(config?.project_monitoring?.llm?.timeout_seconds ?? 60));
     setSyncedFingerprint(nextFingerprint);
-  }, [config, dirty, syncedFingerprint]);
+  }, [config, dirty, syncedFingerprint, pendingSave]);
 
   const updateField = (setter: (value: string) => void) => (value: string) => {
     setDirty(true);
@@ -3539,60 +3775,223 @@ function ConfigView({
         scan_roots: linesToArray(protocolRoots),
         max_scan_depth: config?.protocol?.max_scan_depth ?? 5,
         max_metric_points: config?.protocol?.max_metric_points ?? 120
+      },
+      project_monitoring: {
+        dirs: config?.project_monitoring?.dirs ?? [],
+        llm: {
+          enabled: llmEnabled,
+          provider: llmProvider,
+          base_url: llmBaseUrl.trim(),
+          model: llmModel.trim(),
+          api_key: llmApiKey.trim(),
+          timeout_seconds: Number(llmTimeout) || 60
+        }
       }
     });
+    setPendingSave(true);
+  };
+
+  const discard = () => {
+    setDirty(false);
+    setPendingSave(false);
+    setLlmTestState(null);
+    setError("");
+  };
+
+  const testLlm = () => {
+    setLlmTestState({ tone: "ok", message: t("llmTesting") });
+    apiFetch(`${API_BASE}/api/monitoring/llm/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled: true,
+        provider: llmProvider,
+        base_url: llmBaseUrl.trim(),
+        model: llmModel.trim(),
+        api_key: llmApiKey.trim(),
+        timeout_seconds: Number(llmTimeout) || 60
+      })
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (payload.ok) {
+          setLlmTestState({ tone: "ok", message: `${t("llmTestOk")}: ${payload.reply ?? ""}` });
+        } else {
+          setLlmTestState({ tone: "err", message: `${t("llmTestFailed")}: ${payload.error || "unknown"}` });
+        }
+      })
+      .catch((error: Error) => setLlmTestState({ tone: "err", message: `${t("llmTestFailed")}: ${error.message}` }));
   };
 
   return (
-    <section className="view-stack">
-      <div className="panel">
-        <PanelTitle icon={Settings} title={labels.title} />
-        <div className="config-storage">
-          <Readout label={labels.storage} value={metadata?.path ?? "-"} />
-          <Readout label={metadata?.usingEnvConfig ? labels.envConfig : labels.defaultLocal} value={metadata?.writable ? labels.writable : labels.readOnly} />
+    <section className="view-stack config-page">
+      <div className="panel config-hero">
+        <div className="config-hero-head">
+          <div className="config-hero-title">
+            <span className="config-hero-icon">
+              <Settings size={20} />
+            </span>
+            <div>
+              <h2>{labels.title}</h2>
+              <p>{labels.subtitle}</p>
+            </div>
+          </div>
+          <div className="config-chips">
+            <span className="config-chip mono" title={metadata?.path}>{metadata?.path ?? "-"}</span>
+            <span className="config-chip">{metadata?.usingEnvConfig ? labels.envConfig : labels.defaultLocal}</span>
+            <span className={metadata?.writable === false ? "config-chip warn" : "config-chip ok"}>
+              <i className="config-dot" />
+              {metadata?.writable === false ? labels.readOnly : labels.writable}
+            </span>
+          </div>
         </div>
-        <p className="config-hint">{labels.savedHint}</p>
+        <div className="config-live-strip">
+          <i className="config-pulse" />
+          <span>{labels.liveApply}</span>
+          <span className="config-live-note">{labels.savedHint}</span>
+        </div>
       </div>
 
       <div className="config-grid">
-        <div className="panel">
-          <PanelTitle icon={Server} title="Collector" />
-          <div className="config-form-grid">
+        <ConfigSection icon={Server} tone="cyan" title={labels.collectorSection} subtitle={labels.collectorSub}>
+          <div className="config-form-grid three">
             <ConfigField label={labels.hostId} value={hostId} onChange={updateField(setHostId)} />
             <ConfigField label={labels.interval} value={interval} onChange={updateField(setIntervalValue)} type="number" />
             <ConfigField label={labels.unmanagedTop} value={unmanagedTop} onChange={updateField(setUnmanagedTop)} type="number" />
           </div>
-        </div>
+        </ConfigSection>
 
-        <div className="panel">
-          <PanelTitle icon={Layers3} title="Discovery" />
+        <ConfigSection icon={Layers3} tone="blue" title={labels.discoverySection} subtitle={labels.discoverySub}>
           <div className="config-form-grid two">
             <ConfigTextarea label={labels.experimentRoots} hint={labels.onePerLine} value={experimentRoots} onChange={updateField(setExperimentRoots)} />
             <ConfigTextarea label={labels.includeCwd} hint={labels.onePerLine} value={includeCwd} onChange={updateField(setIncludeCwd)} />
             <ConfigTextarea label={labels.protocolRoots} hint={labels.onePerLine} value={protocolRoots} onChange={updateField(setProtocolRoots)} />
           </div>
-        </div>
+        </ConfigSection>
 
-        <div className="panel">
-          <PanelTitle icon={SlidersHorizontal} title="Parser" />
+        <ConfigSection icon={SlidersHorizontal} tone="violet" title={labels.parserSection} subtitle={labels.parserSub}>
           <div className="config-form-grid two">
             <ConfigTextarea label={labels.includeKeywords} hint={labels.onePerLine} value={includeKeywords} onChange={updateField(setIncludeKeywords)} />
             <ConfigTextarea label={labels.excludeKeywords} hint={labels.onePerLine} value={excludeKeywords} onChange={updateField(setExcludeKeywords)} />
-            <ConfigTextarea label={labels.explicitRules} value={rulesJson} onChange={updateField(setRulesJson)} mono />
+            <div className="config-field wide mono">
+              <span>{labels.explicitRules}</span>
+              <textarea value={rulesJson} onChange={(event) => updateField(setRulesJson)(event.target.value)} rows={7} />
+            </div>
           </div>
-        </div>
+        </ConfigSection>
+
+        <ConfigSection
+          icon={Sparkles}
+          tone="amber"
+          title={t("llmSection")}
+          subtitle={t("llmSectionBody")}
+          extra={(
+            <button className="action-button" onClick={testLlm}>
+              <Zap size={16} />
+              {t("llmTest")}
+            </button>
+          )}
+        >
+          <div className="config-form-grid two">
+            <label className="config-toggle">
+              <span className="config-toggle-text">{t("llmEnabled")}</span>
+              <input
+                type="checkbox"
+                checked={llmEnabled}
+                onChange={(event) => {
+                  setDirty(true);
+                  setLlmEnabled(event.target.checked);
+                }}
+              />
+              <i className="toggle-track">
+                <i className="toggle-knob" />
+              </i>
+            </label>
+            <label className="config-field">
+              <span>{t("llmProvider")}</span>
+              <select value={llmProvider} onChange={(event) => updateField(setLlmProvider)(event.target.value)}>
+                <option value="openai-compatible">openai-compatible</option>
+                <option value="openai">openai</option>
+                <option value="deepseek">deepseek</option>
+                <option value="anthropic">anthropic</option>
+                <option value="ollama">ollama</option>
+                <option value="opencode">opencode</option>
+              </select>
+            </label>
+            <ConfigField label={t("llmBaseUrl")} value={llmBaseUrl} onChange={updateField(setLlmBaseUrl)} />
+            <ConfigField label={t("llmModel")} value={llmModel} onChange={updateField(setLlmModel)} />
+            <ConfigField label={t("llmApiKey")} value={llmApiKey} onChange={updateField(setLlmApiKey)} type="password" />
+            <ConfigField label={t("llmTimeout")} value={llmTimeout} onChange={updateField(setLlmTimeout)} type="number" />
+          </div>
+          {llmTestState && (
+            <p className={llmTestState.tone === "ok" ? "config-inline-status ok" : "config-inline-status err"}>
+              {llmTestState.message}
+            </p>
+          )}
+        </ConfigSection>
       </div>
 
       <div className="config-save-bar">
-        <div>
-          {error && <strong>{error}</strong>}
-          {!error && operationMessage && <span>{operationMessage}</span>}
+        <div className="config-save-status">
+          {error ? (
+            <strong>{error}</strong>
+          ) : dirty || pendingSave ? (
+            <span className="save-state unsaved">
+              <i className="config-dot amber" />
+              {labels.unsaved}
+            </span>
+          ) : (
+            <span className="save-state saved">
+              <Check size={14} />
+              {operationMessage || labels.savedOk}
+            </span>
+          )}
         </div>
-        <button className="action-button active-action" onClick={submit} disabled={saving || metadata?.writable === false}>
-          {saving ? labels.saving : labels.save}
-        </button>
+        <div className="config-save-actions">
+          {(dirty || pendingSave) && (
+            <button className="action-button" onClick={discard} disabled={saving}>
+              <RotateCcw size={15} />
+              {labels.discard}
+            </button>
+          )}
+          <button className="action-button active-action" onClick={submit} disabled={saving || metadata?.writable === false}>
+            {saving ? labels.saving : labels.save}
+          </button>
+        </div>
       </div>
     </section>
+  );
+}
+
+function ConfigSection({
+  icon: Icon,
+  tone,
+  title,
+  subtitle,
+  extra,
+  children
+}: {
+  icon: typeof Activity;
+  tone: "cyan" | "blue" | "violet" | "amber";
+  title: string;
+  subtitle?: string;
+  extra?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="panel config-section">
+      <div className="config-section-head">
+        <span className={`config-section-icon ${tone}`}>
+          <Icon size={16} />
+        </span>
+        <div className="config-section-heading">
+          <h3>{title}</h3>
+          {subtitle && <p>{subtitle}</p>}
+        </div>
+        {extra && <div className="config-section-extra">{extra}</div>}
+      </div>
+      <div className="config-section-body">{children}</div>
+    </div>
   );
 }
 
@@ -3600,17 +3999,48 @@ function ConfigField({
   label,
   value,
   onChange,
-  type = "text"
+  type = "text",
+  hint
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   type?: string;
+  hint?: string;
 }) {
+  const [revealed, setRevealed] = useState(false);
+  if (type === "password") {
+    return (
+      <label className="config-field">
+        <span>{label}</span>
+        <span className="config-input-group">
+          <input
+            type={revealed ? "text" : "password"}
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            autoComplete="off"
+          />
+          <button
+            type="button"
+            className="config-input-toggle"
+            aria-label={revealed ? "Hide" : "Show"}
+            onClick={(event) => {
+              event.preventDefault();
+              setRevealed((current) => !current);
+            }}
+          >
+            {revealed ? <EyeOff size={15} /> : <Eye size={15} />}
+          </button>
+        </span>
+        {hint && <em>{hint}</em>}
+      </label>
+    );
+  }
   return (
     <label className="config-field">
       <span>{label}</span>
       <input type={type} value={value} onChange={(event) => onChange(event.target.value)} />
+      {hint && <em>{hint}</em>}
     </label>
   );
 }
@@ -4215,10 +4645,424 @@ const PROJECT_TEXT = {
   }
 } as const;
 
+const MONITORING_METRIC_KINDS: Array<{ value: MonitoredMetrics["kind"]; labelKey: TextKey }> = [
+  { value: "none", labelKey: "metricNone" },
+  { value: "regex", labelKey: "metricFormat" },
+  { value: "jsonl", labelKey: "metricFormat" },
+  { value: "csv", labelKey: "metricFormat" },
+  { value: "tensorboard", labelKey: "metricFormat" },
+  { value: "wandb", labelKey: "metricFormat" },
+  { value: "mlflow", labelKey: "metricFormat" }
+];
+
+type CandidateEditor = {
+  candidate: MonitoringCandidate;
+  included: boolean;
+  name: string;
+  metricsKind: MonitoredMetrics["kind"];
+  metricPath: string;
+  pattern: string;
+  fieldsText: string;
+};
+
+function MonitoringDialog({
+  initialPath,
+  llm,
+  dirs,
+  requestConfirm,
+  onClose
+}: {
+  initialPath: string;
+  llm?: MonitoringLlm;
+  dirs: MonitoredDir[];
+  requestConfirm: (config: PendingConfirm) => void;
+  onClose: () => void;
+}) {
+  const t = useT();
+  const language = useContext(I18nContext);
+  const [path, setPath] = useState(initialPath);
+  const [projectName, setProjectName] = useState("");
+  const [resourceType, setResourceType] = useState("unknown");
+  const [useLlm, setUseLlm] = useState(Boolean(llm?.enabled));
+  const [scanning, setScanning] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [report, setReport] = useState<MonitoringScanReport | null>(null);
+  const [scanError, setScanError] = useState("");
+  const [editors, setEditors] = useState<CandidateEditor[]>([]);
+  const [expandedPreview, setExpandedPreview] = useState<string | null>(null);
+
+  const llmConfigured = Boolean(llm?.enabled);
+
+  const browseDirectory = useCallback(() => {
+    void DESKTOP_BRIDGE?.pickDirectory?.()
+      .then((result) => {
+        if (result?.canceled !== true && result?.path) {
+          setPath(result.path);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  const runScan = useCallback(() => {
+    setScanning(true);
+    setScanError("");
+    setReport(null);
+    apiFetch(`${API_BASE}/api/monitoring/scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, useLlm })
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || `collector ${response.status}`);
+        }
+        return payload as MonitoringScanReport;
+      })
+      .then((payload) => {
+        setReport(payload);
+        setEditors(
+          (payload.candidates ?? []).map((candidate) => ({
+            candidate,
+            included: true,
+            name: candidate.name,
+            metricsKind: candidate.metrics.kind,
+            metricPath: candidate.metrics.path ?? "",
+            pattern: candidate.metrics.pattern ?? "",
+            fieldsText: (candidate.metrics.fields ?? []).join(", ")
+          }))
+        );
+      })
+      .catch((error: Error) => setScanError(error.message))
+      .finally(() => setScanning(false));
+  }, [path, useLlm]);
+
+  const updateEditor = useCallback((index: number, patch: Partial<CandidateEditor>) => {
+    setEditors((current) => current.map((editor, editorIndex) => (
+      editorIndex === index ? { ...editor, ...patch } : editor
+    )));
+  }, []);
+
+  const save = useCallback(() => {
+    const runs: MonitoredRunRec[] = editors
+      .filter((editor) => editor.included)
+      .map((editor) => ({
+        name: editor.name.trim() || editor.candidate.name,
+        scope: editor.candidate.scope,
+        logs: editor.candidate.logs,
+        metrics: {
+          kind: editor.metricsKind,
+          path: editor.metricPath.trim(),
+          pattern: editor.pattern.trim(),
+          fields: editor.fieldsText.split(",").map((item) => item.trim()).filter(Boolean)
+        },
+        status: ""
+      }));
+    setSaving(true);
+    apiFetch(`${API_BASE}/api/monitoring/dirs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path,
+        enabled: true,
+        project: projectName.trim(),
+        resource_type: resourceType,
+        recognition: { runs }
+      })
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || `collector ${response.status}`);
+        }
+        onClose();
+      })
+      .catch((error: Error) => setScanError(error.message))
+      .finally(() => setSaving(false));
+  }, [editors, onClose, path, projectName, resourceType]);
+
+  const remove = useCallback(() => {
+    const index = dirs.findIndex((item) => item.path === path);
+    if (index < 0) {
+      onClose();
+      return;
+    }
+    requestConfirm({
+      title: t("confirmRemoveDirTitle"),
+      body: `${t("confirmRemoveDirBody")}\n${path}`,
+      confirmLabel: t("removeMonitoredDir"),
+      tone: "danger",
+      onConfirm: () => {
+        apiFetch(`${API_BASE}/api/monitoring/dirs/${index}`, { method: "DELETE" })
+          .catch(() => undefined)
+          .finally(onClose);
+      }
+    });
+  }, [dirs, onClose, path, requestConfirm, t]);
+
+  const includeCount = editors.filter((editor) => editor.included).length;
+  const llmStatus = report?.llm;
+
+  return (
+    <div className="confirm-overlay" role="presentation" onMouseDown={onClose}>
+      <section
+        className="confirm-dialog monitoring-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="monitoring-dialog-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="confirm-content">
+          <h2 id="monitoring-dialog-title">{t("addMonitoredDir")}</h2>
+          <div className="monitoring-path-row">
+            <label className="config-field">
+              <span>{t("monitoredDirPath")}</span>
+              <input value={path} onChange={(event) => setPath(event.target.value)} placeholder="D:/projects/my-experiments/results" />
+            </label>
+            {DESKTOP_BRIDGE?.pickDirectory && (
+              <button className="action-button" onClick={browseDirectory} title={t("browseDir")}>
+                <FolderOpen size={16} />
+                {t("browseDir")}
+              </button>
+            )}
+            <button className="action-button active-action" onClick={runScan} disabled={scanning || !path.trim()}>
+              <Search size={16} />
+              {scanning ? t("scanningDirectory") : t("scanDirectory")}
+            </button>
+          </div>
+          <div className="monitoring-options">
+            <label className="monitoring-llm-toggle">
+              <input type="checkbox" checked={useLlm} disabled={!llmConfigured} onChange={(event) => setUseLlm(event.target.checked)} />
+              <span>{t("llmAssist")}</span>
+            </label>
+            <small>{llmConfigured ? t("llmAssistHint") : t("llmUnavailable")}</small>
+          </div>
+
+          {scanError && <pre className="git-command-output monitoring-error">{scanError}</pre>}
+          {llmStatus?.used && <p className="monitoring-llm-note">{t("llmUsed")}</p>}
+          {llmStatus?.error && <p className="monitoring-llm-note monitoring-error-text">{t("llmError")}: {llmStatus.error}</p>}
+
+          {report && (
+            <div className="monitoring-report">
+              <div className="monitoring-report-head">
+                <span>
+                  {t("scanSummary")}: {report.exists ? `${report.tree?.files ?? 0} ${t("scanFiles")} · ${report.tree?.dirs ?? 0} ${t("scanDirs")} · ${report.tree ? formatBytes(report.tree.bytes) : "-"}` : t("noCandidatesBody")}
+                </span>
+                <span className="monitoring-head-actions">
+                  <span>{editors.length} {t("scanCandidates")}</span>
+                  {editors.length > 0 && (
+                    <button
+                      type="button"
+                      className="monitoring-select-all"
+                      onClick={() => {
+                        const target = !editors.every((editor) => editor.included);
+                        setEditors((current) => current.map((editor) => ({ ...editor, included: target })));
+                      }}
+                    >
+                      {editors.every((editor) => editor.included) ? t("deselectAll") : t("selectAll")}
+                    </button>
+                  )}
+                </span>
+              </div>
+              {!report.exists && <EmptyPanel title={t("noCandidates")} body={t("noCandidatesBody")} />}
+              {report.exists && !editors.length && <EmptyPanel title={t("noCandidates")} body={t("noCandidatesBody")} />}
+              <div className="monitoring-candidates">
+                {editors.map((editor, index) => (
+                  <div key={`${editor.candidate.scope}-${index}`} className="monitoring-candidate">
+                    <div className="monitoring-candidate-head">
+                      <label className="monitoring-include">
+                        <input
+                          type="checkbox"
+                          checked={editor.included}
+                          onChange={(event) => updateEditor(index, { included: event.target.checked })}
+                        />
+                        <span>{t("includeRun")}</span>
+                      </label>
+                      <input
+                        className="monitoring-name"
+                        value={editor.name}
+                        onChange={(event) => updateEditor(index, { name: event.target.value })}
+                        aria-label={t("runName")}
+                      />
+                      <span className="monitoring-confidence">{t("confidence")}: {translate(language, editor.candidate.confidence === "high" ? "confidenceHigh" : editor.candidate.confidence === "medium" ? "confidenceMedium" : "confidenceLow")}</span>
+                      <em className={`monitoring-source ${editor.candidate.source}`}>{editor.candidate.source === "llm" ? t("sourceLlm") : t("sourceHeuristic")}</em>
+                      <StatusPill status={editor.candidate.status === "running" ? "running" : "finished"} />
+                    </div>
+                    <div className="monitoring-candidate-body">
+                      <div className="monitoring-field">
+                        <span>{t("runScope")}</span>
+                        <code>{editor.candidate.scope || "."}</code>
+                      </div>
+                      <div className="monitoring-field">
+                        <span>{t("logFiles")}</span>
+                        <code>{(editor.candidate.logs ?? []).join(", ") || "-"}</code>
+                      </div>
+                      <div className="monitoring-metrics-row">
+                        <select
+                          value={editor.metricsKind}
+                          onChange={(event) => updateEditor(index, { metricsKind: event.target.value as MonitoredMetrics["kind"] })}
+                          aria-label={t("metricFormat")}
+                        >
+                          {MONITORING_METRIC_KINDS.map((kind) => (
+                            <option key={kind.value} value={kind.value}>
+                              {kind.value === "none" ? t(kind.labelKey) : kind.value}
+                            </option>
+                          ))}
+                        </select>
+                        {(editor.metricsKind === "regex" || editor.metricsKind === "jsonl" || editor.metricsKind === "csv") && (
+                          <input
+                            value={editor.metricPath}
+                            onChange={(event) => updateEditor(index, { metricPath: event.target.value })}
+                            placeholder={t("metricPath")}
+                            aria-label={t("metricPath")}
+                          />
+                        )}
+                      </div>
+                      {editor.metricsKind === "regex" && (
+                        <div className="monitoring-metrics-row">
+                          <input
+                            value={editor.pattern}
+                            onChange={(event) => updateEditor(index, { pattern: event.target.value })}
+                            placeholder={t("regexPattern")}
+                            aria-label={t("regexPattern")}
+                          />
+                          <input
+                            value={editor.fieldsText}
+                            onChange={(event) => updateEditor(index, { fieldsText: event.target.value })}
+                            placeholder={t("regexFields")}
+                            aria-label={t("regexFields")}
+                          />
+                        </div>
+                      )}
+                      {(editor.metricsKind === "regex" || editor.metricsKind === "jsonl" || editor.metricsKind === "csv") && editor.candidate.metricPreview && (
+                        <div className="monitoring-preview">
+                          <span>{t("metricPreview")} ({editor.candidate.metricPreview.rowCount} {t("metricRows")})</span>
+                          <pre>{JSON.stringify(editor.candidate.metricPreview.rows.slice(0, 4), null, 2)}</pre>
+                        </div>
+                      )}
+                      {editor.candidate.logPreview?.length ? (
+                        <div className="monitoring-preview">
+                          <button
+                            type="button"
+                            className="monitoring-preview-toggle"
+                            onClick={() => setExpandedPreview(expandedPreview === editor.candidate.scope ? null : editor.candidate.scope)}
+                          >
+                            {t("logPreview")}
+                          </button>
+                          {expandedPreview === editor.candidate.scope && (
+                            <pre>{editor.candidate.logPreview.join("\n")}</pre>
+                          )}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="monitoring-report-actions">
+                <label className="config-field">
+                  <span>{t("projectRun")}</span>
+                  <input value={projectName} onChange={(event) => setProjectName(event.target.value)} />
+                </label>
+                <label className="config-field">
+                  <span>{t("resource")}</span>
+                  <select value={resourceType} onChange={(event) => setResourceType(event.target.value)}>
+                    <option value="unknown">unknown</option>
+                    <option value="gpu">gpu</option>
+                    <option value="cpu">cpu</option>
+                    <option value="hybrid">hybrid</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="confirm-actions">
+          <button className="action-button danger-action" onClick={remove} disabled={saving}>
+            <Trash2 size={16} />
+            {t("removeMonitoredDir")}
+          </button>
+          <span className="monitoring-spacer" />
+          <button className="action-button" onClick={onClose}>
+            {t("cancel")}
+          </button>
+          <button className="action-button active-action" onClick={save} disabled={saving || !report?.exists || !includeCount}>
+            {saving ? t("saving") : t("saveMonitoredDir")}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function MonitoredDirsPanel({
+  config,
+  requestConfirm
+}: {
+  config?: CollectorConfig;
+  requestConfirm: (config: PendingConfirm) => void;
+}) {
+  const t = useT();
+  const [dialogPath, setDialogPath] = useState<string | null>(null);
+  const dirs = config?.project_monitoring?.dirs ?? [];
+  const llm = config?.project_monitoring?.llm;
+
+  return (
+    <div className="panel">
+      <div className="project-panel-head">
+        <PanelTitle icon={FolderSearch} title={t("monitoredDirs")} />
+        <div className="project-actions">
+          <button className="action-button active-action" onClick={() => setDialogPath("")}>
+            <FolderPlus size={16} />
+            {t("addMonitoredDir")}
+          </button>
+        </div>
+      </div>
+      <p className="monitoring-panel-hint">{t("monitoredDirsBody")}</p>
+      {dirs.length ? (
+        <div className="monitoring-dir-list">
+          {dirs.map((dir) => (
+            <button key={dir.path} className="monitoring-dir-row" onClick={() => setDialogPath(dir.path)}>
+              <strong>{dir.project || dir.path}</strong>
+              <span>{dir.path}</span>
+              <small>
+                {dir.enabled ? `${(dir.recognition?.runs ?? []).length} ${t("scanCandidates")}` : t("collectorOffline")}
+                {dir.resource_type ? ` · ${dir.resource_type}` : ""}
+              </small>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <EmptyPanel title={t("noCandidates")} body={t("monitoredDirsBody")} />
+      )}
+      {dialogPath !== null && (
+        <MonitoringDialog initialPath={dialogPath} llm={llm} dirs={dirs} requestConfirm={requestConfirm} onClose={() => setDialogPath(null)} />
+      )}
+    </div>
+  );
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
 function ProjectsView({
   projects,
   runs,
   hosts,
+  config,
   userFilter,
   userOptions,
   onUserFilter,
@@ -4228,6 +5072,7 @@ function ProjectsView({
   projects: Project[];
   runs: Run[];
   hosts: Host[];
+  config?: CollectorConfig;
   userFilter: string;
   userOptions: UserOption[];
   onUserFilter: (value: string) => void;
@@ -4445,6 +5290,7 @@ function ProjectsView({
   if (!projects.length) {
     return (
       <section className="view-stack">
+        <MonitoredDirsPanel config={config} requestConfirm={requestConfirm} />
         <div className="panel">
           <div className="project-empty-filter">
             <UserFilterControl value={userFilter} options={userOptions} onChange={onUserFilter} />
@@ -4479,6 +5325,7 @@ function ProjectsView({
       </div>
 
       <div className="project-main">
+        <MonitoredDirsPanel config={config} requestConfirm={requestConfirm} />
         {selectedProject && (
           <div className="panel project-hero">
             <div>
@@ -4689,7 +5536,7 @@ function RunDetail({
           {operationMessage && <span className="operation-message">{operationMessage}</span>}
           <button
             className="action-button danger-action"
-            disabled={run.status !== "running" || killInFlight === run.id}
+            disabled={run.status !== "running" || killInFlight === run.id || !run.rootPid}
             onClick={() => onKillRun(run)}
             title={language === "zh" ? "终止根进程及子进程" : "Kill root process and children"}
           >
@@ -4713,6 +5560,11 @@ function RunDetail({
           <div className="detail-kicker">
             <StatusPill status={run.status} />
             <ResourceBadge type={run.resourceType} />
+            {run.source === "directory" && (
+              <span className="run-mark candidate" title={t("directorySourceHint")}>
+                <FolderSearch size={13} /> {t("directorySource")}
+              </span>
+            )}
             {run.metadata?.pinned && <span className="run-mark important">{t("pinned")}</span>}
             {run.metadata?.mark && <span className={`run-mark ${run.metadata.mark}`}>{run.metadata.mark}</span>}
             <span>{t("accessLevelLabel")} {run.accessLevel}</span>
