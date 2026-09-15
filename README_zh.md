@@ -1,4 +1,6 @@
-# ExpMon
+<img src="public/expmon-logo.png" alt="ExpMon 仓鼠标志" width="80" height="80" />
+
+# ExpMon：实验任务、GPU 与 SSH 主机监控
 
 **一个客户端，看清所有实验、GPU 与 SSH 服务器。**
 
@@ -13,7 +15,7 @@ ExpMon 为研究团队提供一个本地优先的统一视图，把训练进程�
 
 ![ExpMon 资源总览](docs/images/expmon-dashboard.png)
 
-_截图使用隐私安全的演示数据，可以通过 `npm run screenshots:readme` 重新生成。_
+_截图展示当前桌面界面与白底仓鼠标志。主机和任务均为虚构演示数据，不包含真实监控会话；可以通过 `npm run screenshots:readme` 重新生成。_
 
 ## 为什么使用 ExpMon
 
@@ -24,6 +26,8 @@ _截图使用隐私安全的演示数据，可以通过 `npm run screenshots:rea
 - **直接利用已有实验日志：** TensorBoard loss、JSONL、CSV、W&B offline run 和 MLflow 目录会与资源历史一起呈现。
 
 ## 产品界面
+
+浅色界面采用紧凑侧栏、统一的资源配色、易读的表格和连接状态指示，覆盖资源总览、Host / SSH 与任务列表。顶部可以切换中英文。
 
 ### 所有 SSH 主机，一个入口
 
@@ -61,9 +65,19 @@ npm run desktop:start
 npm run desktop:dist
 ```
 
-安装包输出到 `release-client/ExpMon-Setup-<version>-x64.exe`。安装版内置 React UI 和 Python collector，自动选择空闲的 loopback 端口，用每次启动生成的 token 保护本地 API，并在退出时清理 collector 进程树。用户无需另行安装 Python 或 Node.js。
+安装包输出到用户的“文档”目录：`Documents/ExpMon-release/ExpMon-Setup-<version>-x64.exe`。安装版内置 React UI 和 Python collector，自动选择空闲的 loopback 端口，用每次启动生成的 token 保护本地 API，并在退出时清理 collector 进程树。用户无需另行安装 Python 或 Node.js。
 
 桌面配置、SSH profile、运行元数据、受管理运行和 collector 日志存放在 Electron 的 ExpMon 用户数据目录。
+
+### 本地历史与状态恢复
+
+桌面客户端在同一用户数据目录下维护轻量 SQLite 数据库 `expmon-history.db`，使用 Node 内置的 `node:sqlite`，无需额外原生模块，用于保存：
+
+- **界面状态：** 上次页面、选中的主机或任务、搜索内容和筛选条件，供下次启动恢复。
+- **缓存快照：** 最近保存的主机、任务和 SSH 配置，在等待新采样时显示。
+- **采样历史：** 主机和任务采样按连续片段（episode）归档。连续采样合并为一条记录，间隔超过 2 分钟时开始新片段；功率曲线保留逐次采样点，按同样规则统计片段，操作事件则逐条计数。
+
+顶部历史标记显示片段数量，可清空本地历史但保留界面状态。旁边的恢复按钮可以查看恢复详情和已记录的历史。
 
 ### 浏览器开发模式
 
@@ -79,7 +93,7 @@ npm run start:local
 powershell -ExecutionPolicy Bypass -File .\scripts\start-expmon.ps1 -CollectorPort 5185 -FrontendPort 5174 -Config .\expmon-local.yaml
 ```
 
-需要本地环境变量覆盖时，可以把 `.env.example` 复制为 `.env`。包含本地状态的文件和生成的桌面产物都会被 Git 忽略。
+需要本地环境变量覆盖时，可以把 `.env.example` 复制为 `.env`。本地配置、运行状态、安装包和临时构建产物会被 Git 忽略；共享的品牌素材则纳入版本管理。
 
 ## 受管理的运行
 
@@ -200,6 +214,19 @@ python scripts/expmon.py adopt --pid 3637117 --project NeuroSTORM \
 ## 项目工作区
 
 **Projects** 页面会按 Git 根目录或工作目录对运行进行分组。对于 Git 仓库，它可以显示最近日志、变更文件、diff 统计、内联 diff，选择文件，生成或编辑 commit message，创建 commit，并通过本地 collector 执行 `git pull --ff-only` 或 `git push`。
+
+## 品牌素材
+
+侧栏、浏览器 favicon、Windows 图标和 README 共用白色圆角底板上的青绿色仓鼠。源图为 [`assets/expmon-hamster.png`](assets/expmon-hamster.png)，[生成说明](assets/README.md) 记录了素材来源和编辑提示词。
+
+在 Windows 上重新生成各尺寸图标，然后构建应用：
+
+```powershell
+npm run desktop:icons
+npm run build
+```
+
+更新标志时，请一起提交源图和生成的 PNG/ICO 文件。修改界面或标志后，也应通过下面的命令重新生成 README 截图。
 
 ## 测试
 

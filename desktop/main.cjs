@@ -299,6 +299,35 @@ async function runSmokeCapture(window, collectorUrl, logPath) {
   if (settleMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, settleMs));
   }
+  const framed = process.env.EXPMON_DESKTOP_SMOKE_FRAME === "1";
+  if (framed) {
+    // Add a documentation frame while preserving the app's original viewport.
+    const [width, height] = window.getContentSize();
+    window.setContentSize(width + 34, height + 34);
+    await window.webContents.insertCSS(`
+      html:root, html body { width: 100%; height: 100%; min-height: 0; overflow: hidden; }
+      html body { padding: 16px; background: #f3f4f6; }
+      html #root {
+        width: ${width + 2}px;
+        height: ${height + 2}px;
+        min-height: 0;
+        overflow: auto;
+        border: 1px solid #c8cdd4;
+        border-radius: 8px;
+        background: #fff;
+      }
+      #root .app-shell { min-height: ${height}px; }
+      #root .sidebar { height: ${height}px; }
+    `);
+    await window.webContents.executeJavaScript(`new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    })`);
+  }
+  const captureState = await window.webContents.executeJavaScript(`(() => ({
+    collectorConnected: document.body.innerText.includes("collector connected"),
+    pageTitle: document.querySelector("h1")?.textContent?.trim() ?? "",
+    activeView: document.querySelector(".nav-item.active")?.dataset.view ?? "",
+  }))()`);
   fs.mkdirSync(outputDir, { recursive: true });
   const image = await window.webContents.capturePage();
   fs.writeFileSync(path.join(outputDir, "desktop.png"), image.toPNG());
@@ -308,8 +337,10 @@ async function runSmokeCapture(window, collectorUrl, logPath) {
     collectorUrl,
     collectorLog: logPath,
     smokeView,
+    framed,
     ...rendererState,
     ...restoreListState,
+    ...captureState,
   }, null, 2));
   app.quit();
 }

@@ -46,7 +46,7 @@ function host({ id, name, address, user, cpu, memoryUsed, memoryTotal, model, gp
   const gpus = Array.from({ length: gpuCount }, (_, index) => gpu(
     index,
     model,
-    model.includes("H200") ? 143360 : 49140,
+    model.includes("H200") ? 143360 : (model.includes("4090") ? 24576 : 49140),
     index < busyGpus ? Math.max(18, Math.min(98, 91 - index * 7 + phase)) : 1,
     index < busyGpus ? Math.max(22, Math.min(94, 78 - index * 5 + phase)) : 2,
     index < busyGpus,
@@ -94,7 +94,7 @@ const hosts = [
   host({ id: "ssh:compute-01", name: "Compute-01", address: "10.20.0.51", user: "carol", cpu: 82, memoryUsed: 386.4, memoryTotal: 768, model: "NVIDIA L40S", gpuCount: 4, busyGpus: 4, coreCount: 72, phase: 10 }),
 ];
 
-function run({ id, project, name, status, hostId, user, pid, cpu, memory, gpuIndex, metric, runtime, kind = "python" }) {
+function run({ id, project, name, status, hostId, user, pid, cpu, memory, gpuMemory = 0, gpuIndex, metric, runtime, kind = "python" }) {
   const finished = status !== "running";
   return {
     id,
@@ -115,7 +115,7 @@ function run({ id, project, name, status, hostId, user, pid, cpu, memory, gpuInd
     cpuPercent: Math.round(cpu * 1.8 * 10) / 10,
     memoryGb: memory,
     gpuLabel: `GPU ${gpuIndex}`,
-    gpuMemoryGb: Math.round(memory * 1.7 * 10) / 10,
+    gpuMemoryGb: gpuMemory,
     gpuUtilPercent: finished ? 0 : 88 - gpuIndex * 3,
     gpuPowerW: finished ? 0 : 410 - gpuIndex * 12,
     gpuTemperatureC: finished ? 38 : 61 - gpuIndex,
@@ -137,7 +137,7 @@ function run({ id, project, name, status, hostId, user, pid, cpu, memory, gpuInd
       gpuHours: 18.4,
       avgGpuUtil: 84.2,
       maxGpuUtil: 100,
-      maxGpuMemoryGb: Math.round(memory * 1.7 * 10) / 10,
+      maxGpuMemoryGb: gpuMemory,
       avgCpu: cpu,
       maxMemoryGb: memory,
       totalReadMiB: 42560,
@@ -158,10 +158,10 @@ function run({ id, project, name, status, hostId, user, pid, cpu, memory, gpuInd
 }
 
 const runs = [
-  run({ id: "run-neuro-1", project: "NeuroAtlas", name: "hcp-foundation-pretrain", status: "running", hostId: "ssh:h200-01", user: "alice", pid: 42018, cpu: 312, memory: 74.6, gpuIndex: 0, metric: "train_loss=0.184", runtime: "8h42m" }),
-  run({ id: "run-vision-1", project: "VisionLab", name: "segmentation-fold-2", status: "running", hostId: "ssh:atlas-01", user: "bob", pid: 38104, cpu: 228, memory: 42.3, gpuIndex: 2, metric: "dice=0.914", runtime: "3h16m" }),
-  run({ id: "run-language-1", project: "MedLLM", name: "instruction-tune", status: "running", hostId: "ssh:h200-01", user: "carol", pid: 42188, cpu: 486, memory: 128.7, gpuIndex: 4, metric: "valid_loss=0.231", runtime: "6h05m" }),
-  run({ id: "run-diffusion-1", project: "ImageForge", name: "latent-diffusion-xl", status: "running", hostId: "ssh:compute-01", user: "dana", pid: 29876, cpu: 364, memory: 89.4, gpuIndex: 1, metric: "fid=7.82", runtime: "11h20m" }),
+  run({ id: "run-neuro-1", project: "NeuroAtlas", name: "hcp-foundation-pretrain", status: "running", hostId: "ssh:h200-01", user: "alice", pid: 42018, cpu: 312, memory: 74.6, gpuMemory: 126.8, gpuIndex: 0, metric: "train_loss=0.184", runtime: "8h42m" }),
+  run({ id: "run-vision-1", project: "VisionLab", name: "segmentation-fold-2", status: "running", hostId: "ssh:atlas-01", user: "bob", pid: 38104, cpu: 228, memory: 42.3, gpuMemory: 42.3, gpuIndex: 2, metric: "dice=0.914", runtime: "3h16m" }),
+  run({ id: "run-language-1", project: "MedLLM", name: "instruction-tune", status: "running", hostId: "ssh:h200-01", user: "carol", pid: 42188, cpu: 486, memory: 128.7, gpuMemory: 118.6, gpuIndex: 4, metric: "valid_loss=0.231", runtime: "6h05m" }),
+  run({ id: "run-diffusion-1", project: "ImageForge", name: "latent-diffusion-xl", status: "running", hostId: "ssh:compute-01", user: "dana", pid: 29876, cpu: 364, memory: 89.4, gpuMemory: 39.8, gpuIndex: 1, metric: "fid=7.82", runtime: "11h20m" }),
   run({ id: "run-neuro-2", project: "NeuroAtlas", name: "ablation-mask-075", status: "finished", hostId: "ssh:h200-01", user: "alice", pid: 39872, cpu: 0, memory: 0, gpuIndex: 3, metric: "test_loss=0.207", runtime: "4h11m", kind: "shell" }),
   run({ id: "run-vision-2", project: "VisionLab", name: "segmentation-fold-1", status: "finished", hostId: "ssh:vision-02", user: "bob", pid: 27641, cpu: 0, memory: 0, gpuIndex: 0, metric: "dice=0.908", runtime: "5h47m" }),
   run({ id: "run-forecast-1", project: "ForecastNet", name: "multisite-baseline", status: "failed", hostId: "ssh:atlas-01", user: "carol", pid: 25118, cpu: 0, memory: 0, gpuIndex: 5, metric: "valid_mae=0.143", runtime: "1h32m" }),
@@ -207,14 +207,17 @@ fs.writeFileSync(fixturePath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
 
 for (const view of ["dashboard", "hosts", "runs"]) {
   const outputDir = path.join(workDir, view);
+  // A fresh profile keeps saved UI state and restore prompts out of screenshots.
+  const dataDir = fs.mkdtempSync(path.join(workDir, `${view}-data-`));
   const result = spawnSync(process.execPath, [path.join(root, "scripts", "desktop-smoke.cjs")], {
     cwd: root,
     env: {
       ...process.env,
-      EXPMON_DESKTOP_DATA_DIR: path.join(outputDir, "data"),
+      EXPMON_DESKTOP_DATA_DIR: dataDir,
       EXPMON_DESKTOP_SMOKE_OUTPUT: outputDir,
       EXPMON_DESKTOP_SMOKE_VIEW: view,
       EXPMON_DESKTOP_SMOKE_SETTLE_MS: "500",
+      EXPMON_DESKTOP_SMOKE_FRAME: "1",
       EXPMON_SNAPSHOT_FIXTURE: fixturePath,
     },
     encoding: "utf8",
@@ -222,6 +225,10 @@ for (const view of ["dashboard", "hosts", "runs"]) {
   });
   if (result.status !== 0) {
     throw new Error(`Failed to capture ${view}\n${result.stdout}\n${result.stderr}`);
+  }
+  const capture = JSON.parse(fs.readFileSync(path.join(outputDir, "result.json"), "utf8"));
+  if (capture.activeView !== view || capture.popoverOpen || !capture.framed) {
+    throw new Error(`Unexpected screenshot state for ${view}: ${JSON.stringify(capture)}`);
   }
   const source = path.join(outputDir, "desktop.png");
   const destination = path.join(imageDir, `expmon-${view}.png`);

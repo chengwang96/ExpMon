@@ -728,7 +728,7 @@ function EpisodeDetail({ episode }: { episode: HistoryEpisode }) {
 
 const TEXT = {
   zh: {
-    appSubtitle: "通用实验任务监控系统",
+    appSubtitle: "实验与资源监控",
     navDashboard: "资源总览",
     navPower: "硬件功率",
     navHosts: "Host / SSH",
@@ -1078,7 +1078,7 @@ const TEXT = {
     llmTestFailed: "LLM 测试失败"
   },
   en: {
-    appSubtitle: "General experiment task monitor",
+    appSubtitle: "Experiments & resources",
     navDashboard: "Resources",
     navPower: "Hardware Power",
     navHosts: "Host / SSH",
@@ -2374,9 +2374,14 @@ function App() {
       <div className="app-shell">
         <aside className="sidebar">
           <div className="brand">
-            <div className="brand-mark">
-              <Activity size={22} />
-            </div>
+            <img
+              className="brand-mark"
+              src="./expmon-logo.png"
+              width={36}
+              height={36}
+              alt=""
+              draggable={false}
+            />
             <div>
               <strong>ExpMon</strong>
               <span>{t("appSubtitle")}</span>
@@ -2390,6 +2395,9 @@ function App() {
                 <button
                   key={item.key}
                   className={activeView === item.key ? "nav-item active" : "nav-item"}
+                  data-view={item.key}
+                  aria-current={activeView === item.key ? "page" : undefined}
+                  aria-label={label}
                   onClick={() => setActiveView(item.key)}
                   title={label}
                 >
@@ -2402,22 +2410,17 @@ function App() {
           <div className="collector-card">
             <div className="collector-row">
               <span>Collector</span>
-              <strong>{snapshot.connected ? t("localLive") : t("offline")}</strong>
-            </div>
-            <div className="collector-pulse">
-              <span />
-              <span />
-              <span />
-              <span />
-              <span />
+              <strong>
+                <i className={`connection-dot ${snapshot.connected ? "online" : "offline"}`} aria-hidden="true" />
+                {snapshot.connected ? t("localLive") : t("offline")}
+              </strong>
             </div>
           </div>
         </aside>
 
         <main className="workspace">
         <header className="topbar">
-          <div>
-            <p className="eyebrow">{t("eyebrow")}</p>
+          <div className="topbar-heading">
             <h1>{viewTitle(activeView, t)}</h1>
           </div>
           <div className="topbar-actions">
@@ -2427,11 +2430,12 @@ function App() {
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder={t("searchPlaceholder")}
+                aria-label={t("searchPlaceholder")}
               />
             </div>
             <div className="language-toggle" aria-label={t("language")}>
-              <button className={language === "en" ? "active" : ""} onClick={() => setLanguage("en")}>EN</button>
-              <button className={language === "zh" ? "active" : ""} onClick={() => setLanguage("zh")}>中文</button>
+              <button className={language === "en" ? "active" : ""} aria-pressed={language === "en"} onClick={() => setLanguage("en")}>EN</button>
+              <button className={language === "zh" ? "active" : ""} aria-pressed={language === "zh"} onClick={() => setLanguage("zh")}>中文</button>
             </div>
             {historyTotal !== null && (
               <button
@@ -2537,8 +2541,10 @@ function App() {
             >
               <RefreshCw size={17} />
             </button>
-            <span className="refresh-indicator">
-              {snapshot.connected ? t("collectorLive") : `${t("collectorOffline")}${snapshot.error ? `: ${snapshot.error}` : ""}`} · {formatClock(lastRefreshAt)}
+            <span className="refresh-indicator" title={snapshot.connected ? t("collectorLive") : `${t("collectorOffline")}${snapshot.error ? `: ${snapshot.error}` : ""}`}>
+              <i className={`connection-dot ${snapshot.connected ? "online" : "offline"}`} aria-hidden="true" />
+              <span>{snapshot.connected ? t("collectorLive") : t("collectorOffline")}</span>
+              <time dateTime={lastRefreshAt.toISOString()}>{formatClock(lastRefreshAt)}</time>
             </span>
           </div>
         </header>
@@ -3248,14 +3254,14 @@ function HardwarePowerView({
             <div className="power-history-chart">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={history} margin={{ top: 8, right: 12, bottom: 0, left: -16 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(113, 128, 150, 0.18)" />
+                  <CartesianGrid vertical={false} stroke="var(--line)" />
                   <XAxis dataKey="time" minTickGap={30} tick={{ fontSize: 11, fill: "#64748b" }} />
                   <YAxis unit=" W" tick={{ fontSize: 11, fill: "#64748b" }} width={64} />
                   <Tooltip formatter={(value) => `${Number(value).toFixed(1)} W`} />
                   <Legend />
-                  <Line type="monotone" dataKey="cpu" name={t("powerCpuPackage")} stroke="#138a7e" strokeWidth={2.2} dot={false} connectNulls />
-                  <Line type="monotone" dataKey="gpu" name={t("powerGpuBoard")} stroke="#4169d8" strokeWidth={2.2} dot={false} connectNulls />
-                  <Line type="monotone" dataKey="total" name={t("powerComponents")} stroke="#b66d16" strokeWidth={2.4} dot={false} connectNulls />
+                  <Line type="monotone" dataKey="cpu" name={t("powerCpuPackage")} stroke="var(--blue)" strokeWidth={2} dot={false} connectNulls />
+                  <Line type="monotone" dataKey="gpu" name={t("powerGpuBoard")} stroke="var(--violet)" strokeWidth={2} dot={false} connectNulls />
+                  <Line type="monotone" dataKey="total" name={t("powerComponents")} stroke="var(--amber)" strokeWidth={2} dot={false} connectNulls />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -3463,7 +3469,7 @@ function Dashboard({
 
   return (
     <section className="view-stack">
-      <div className="metric-grid">
+      <div className="metric-grid overview-metrics">
         <MetricCard icon={Server} label={t("hosts")} value={totals.hosts} accent="cyan" />
         <MetricCard icon={Zap} label={t("busyGpus")} value={`${totals.busyGpus}/${totals.totalGpus}`} accent="blue" />
         <MetricCard icon={Cpu} label={t("cpuAvg")} value={`${totals.cpuAvg}%`} accent="amber" />
@@ -3517,7 +3523,7 @@ function Dashboard({
                   <Readout label="GPU" value={formatGpu(host, t)} />
                   <Readout label={t("runsLabel")} value={`${host.runningRuns} ${t("runningSuffix")}`} />
                 </div>
-                <div className="warning-line">{formatHostWarning(host.warnings[0], t) ?? t("normal")}</div>
+                <div className={`warning-line${host.warnings.length ? " has-warning" : ""}`}>{formatHostWarning(host.warnings[0], t) ?? t("normal")}</div>
               </button>
             ))}
           </div>
@@ -4214,14 +4220,14 @@ function HostsView({
           </div>
           <ResponsiveContainer width="100%" height={220}>
             <AreaChart data={hostIoSeries}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(143, 158, 183, .18)" />
-              <XAxis dataKey="time" stroke="#8fa2bd" tick={{ fontSize: 11 }} />
-              <YAxis stroke="#8fa2bd" tick={{ fontSize: 11 }} />
+              <CartesianGrid vertical={false} stroke="var(--line)" />
+              <XAxis dataKey="time" stroke="var(--muted)" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={36} />
+              <YAxis stroke="var(--muted)" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
               <Tooltip contentStyle={tooltipStyle} />
-              <Area type="monotone" dataKey="read" stroke="#E7A146" fill="#E7A14633" isAnimationActive={false} />
-              <Area type="monotone" dataKey="write" stroke="#7EC7B8" fill="#7EC7B833" isAnimationActive={false} />
-              <Area type="monotone" dataKey="rx" stroke="#7EA4FF" fill="#7EA4FF33" isAnimationActive={false} />
-              <Area type="monotone" dataKey="tx" stroke="#D982A6" fill="#D982A626" isAnimationActive={false} />
+              <Area type="monotone" dataKey="read" stroke="var(--amber)" fill="var(--amber)" fillOpacity={0.08} isAnimationActive={false} />
+              <Area type="monotone" dataKey="write" stroke="var(--teal)" fill="var(--teal)" fillOpacity={0.08} isAnimationActive={false} />
+              <Area type="monotone" dataKey="rx" stroke="var(--blue)" fill="var(--blue)" fillOpacity={0.08} isAnimationActive={false} />
+              <Area type="monotone" dataKey="tx" stroke="var(--rose)" fill="var(--rose)" fillOpacity={0.08} isAnimationActive={false} />
             </AreaChart>
           </ResponsiveContainer>
         </div>
@@ -5605,9 +5611,9 @@ function RunDetail({
                   </div>
                   <ResponsiveContainer width="100%" height={220}>
                     <AreaChart data={group.data}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(143, 158, 183, .18)" />
-                      <XAxis dataKey="time" stroke="#8fa2bd" tick={{ fontSize: 11 }} />
-                      <YAxis domain={[0, 100]} stroke="#8fa2bd" tick={{ fontSize: 11 }} />
+                      <CartesianGrid vertical={false} stroke="var(--line)" />
+                      <XAxis dataKey="time" stroke="var(--muted)" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={36} />
+                      <YAxis domain={[0, 100]} stroke="var(--muted)" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<RawValueTooltip kind="resource" />} />
                       <Legend />
                       {group.series.map((item, index) => (
@@ -5644,9 +5650,9 @@ function RunDetail({
                   </div>
                   <ResponsiveContainer width="100%" height={240}>
                     <AreaChart data={group.data}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(143, 158, 183, .18)" />
-                      <XAxis dataKey="time" stroke="#8fa2bd" tick={{ fontSize: 11 }} />
-                      <YAxis domain={[0, 100]} stroke="#8fa2bd" tick={{ fontSize: 11 }} />
+                      <CartesianGrid vertical={false} stroke="var(--line)" />
+                      <XAxis dataKey="time" stroke="var(--muted)" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={36} />
+                      <YAxis domain={[0, 100]} stroke="var(--muted)" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<RawValueTooltip kind="metric" />} />
                       {group.keys.length <= 4 && <Legend />}
                       {group.keys.map((key, index) => (
@@ -5939,9 +5945,9 @@ function ExperimentLogsPanel({ run }: { run: Run }) {
               </div>
               <ResponsiveContainer width="100%" height={240}>
                 <LineChart data={rows}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(143, 158, 183, .18)" />
-                  <XAxis dataKey="time" stroke="#8fa2bd" tick={{ fontSize: 11 }} />
-                  <YAxis stroke="#8fa2bd" tick={{ fontSize: 11 }} />
+                  <CartesianGrid vertical={false} stroke="var(--line)" />
+                  <XAxis dataKey="time" stroke="var(--muted)" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={36} />
+                  <YAxis stroke="var(--muted)" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={tooltipStyle} />
                   <Legend />
                   {previewKeys.map((key, index) => (
@@ -6579,7 +6585,10 @@ function ResourceOverview({ host }: { host?: Host }) {
   return (
     <div className="resource-overview">
       <div className="panel nvitop-panel">
-        <PanelTitle icon={Zap} title="GPU" />
+        <div className="panel-title-row">
+          <PanelTitle icon={Zap} title="GPU" />
+          <span className="panel-context">{displayHostName(host, t)}</span>
+        </div>
         {gpus.length ? (
           <div className="gpu-list">
             {gpus.map((gpu) => (
@@ -6592,9 +6601,9 @@ function ResourceOverview({ host }: { host?: Host }) {
                   label={t("gpuMemory")}
                   value={gpu.memoryPercent}
                   detail={`${formatMiB(gpu.memoryUsedMiB)} / ${formatMiB(gpu.memoryTotalMiB)}`}
-                  accent="blue"
+                  accent="rose"
                 />
-                <Meter label={t("gpuUtil")} value={gpu.utilization} detail={`${gpu.utilization.toFixed(0)}%`} accent="cyan" />
+                <Meter label={t("gpuUtil")} value={gpu.utilization} detail={`${gpu.utilization.toFixed(0)}%`} accent="violet" />
                 <Meter
                   label={t("power")}
                   value={gpuPowerPercent(gpu)}
@@ -6648,7 +6657,7 @@ function Meter({
   label: string;
   value: number;
   detail: string;
-  accent: "cyan" | "blue" | "amber";
+  accent: "cyan" | "blue" | "amber" | "violet" | "rose";
 }) {
   const clamped = Math.max(0, Math.min(100, value));
   return (
@@ -7593,13 +7602,15 @@ function formatRawSeriesValue(key: string, value: number, kind: "resource" | "me
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
-const chartColors = ["#E7A146", "#7EC7B8", "#7EA4FF", "#D982A6", "#A995FF", "#67D4F2"];
+const chartColors = ["#4176e6", "#208575", "#a87324", "#7b6bb2", "#b85873", "#558eaf"];
 
 const tooltipStyle = {
-  background: "#ffffff",
-  border: "1px solid rgba(113, 128, 150, .28)",
-  borderRadius: 8,
-  color: "#162033"
+  background: "var(--panel)",
+  border: "1px solid var(--line)",
+  borderRadius: 6,
+  boxShadow: "var(--shadow)",
+  color: "var(--text)",
+  fontSize: 12
 };
 
 export default App;

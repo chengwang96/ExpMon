@@ -1,4 +1,6 @@
-# ExpMon
+<img src="public/expmon-logo.png" alt="ExpMon hamster logo" width="80" height="80" />
+
+# ExpMon: Experiment, GPU and SSH Host Monitoring
 
 **One desktop app for experiments, GPUs, and SSH servers.**
 
@@ -13,7 +15,7 @@ ExpMon gives research teams one local-first view of training processes, GPU serv
 
 ![ExpMon resource dashboard](docs/images/expmon-dashboard.png)
 
-_Screenshots use privacy-safe demo data and can be regenerated with `npm run screenshots:readme`._
+_Screenshots show the current desktop interface with the white-background hamster logo. All hosts and runs use synthetic demo data, not real monitoring sessions. Regenerate them with `npm run screenshots:readme`._
 
 ## Why ExpMon
 
@@ -24,6 +26,8 @@ _Screenshots use privacy-safe demo data and can be regenerated with `npm run scr
 - **Use the logs you already have:** TensorBoard loss scalars, JSONL, CSV, W&B offline runs, and MLflow directories appear alongside resource history.
 
 ## Product Tour
+
+The light interface uses a compact sidebar, consistent resource colors, readable tables, and connection indicators across Resources, Host / SSH, and Runs. English and Chinese are available from the header.
 
 ### One view for every SSH host
 
@@ -65,11 +69,15 @@ The installer is written to the user's Documents folder (`Documents/ExpMon-relea
 
 Desktop configuration, SSH profiles, run metadata, managed runs, and collector logs live in Electron's ExpMon user-data directory.
 
-The desktop client also keeps a lightweight SQLite history database (`expmon-history.db` in the same user-data directory, built on Node's bundled `node:sqlite` — no extra native modules). It survives window refreshes and app restarts:
+### Local history and restore
 
-- **UI state** — last view, selected host/run, search and filter settings are restored on launch.
-- **Cached snapshot** — the last dashboard state (hosts, runs, SSH servers) is shown immediately while the collector starts, even when it is offline.
-- **Sampled history** — host/run samples are recorded as *episodes*: all consecutive samples within one continuous session merge into a single record, and a gap longer than 2 minutes starts the next one (power keeps one row per sample for the chart and counts episodes the same way; action events count individually). A header badge shows the episode count; click it to clear the local history (UI state is kept), and the restore button next to it shows restore details.
+The desktop client keeps a lightweight SQLite history database, `expmon-history.db`, in the same user-data directory. It uses Node's bundled `node:sqlite`, with no extra native modules, to store:
+
+- **UI state:** the last view, selected host/run, search, and filters for the next launch.
+- **Cached snapshot:** the last saved hosts, runs, and SSH servers to display while waiting for fresh samples.
+- **Sampled history:** host/run samples grouped into *episodes*. Consecutive samples merge into one record; a gap longer than 2 minutes starts another. Power keeps individual chart samples with the same episode grouping, while action events count individually.
+
+The header history badge shows the episode count and can clear local history while preserving UI state. The adjacent restore button opens restore details and recorded history.
 
 ### Browser development mode
 
@@ -85,7 +93,7 @@ Open `http://127.0.0.1:5173`. Custom ports and a local config can be supplied wi
 powershell -ExecutionPolicy Bypass -File .\scripts\start-expmon.ps1 -CollectorPort 5185 -FrontendPort 5174 -Config .\expmon-local.yaml
 ```
 
-Copy `.env.example` to `.env` for local environment overrides. Both files containing local state and generated desktop artifacts are ignored by Git.
+Copy `.env.example` to `.env` for local environment overrides. Local configuration, runtime state, release bundles, and temporary build output are ignored by Git. Shared brand assets are versioned.
 
 ## Managed Runs
 
@@ -204,6 +212,19 @@ Password SSH profiles are saved locally as requested, but non-interactive connec
 ## Project Workspace
 
 The **Projects** page groups runs by their Git root or working directory. For Git repositories, it can show recent log entries, changed files, diff statistics, inline diffs, select files, generate or edit a commit message, create a commit, and run `git pull --ff-only` or `git push` through the local collector.
+
+## Brand Assets
+
+The sidebar, browser favicon, Windows icon, and README use the same teal hamster on a white rounded tile. The master artwork is [`assets/expmon-hamster.png`](assets/expmon-hamster.png); [generation notes](assets/README.md) document its source and edit prompts.
+
+Regenerate all derived icons on Windows, then rebuild the app:
+
+```powershell
+npm run desktop:icons
+npm run build
+```
+
+Commit the master artwork and generated PNG/ICO assets together. After changing the interface or logo, also regenerate the README screenshots using the command below.
 
 ## Testing
 
